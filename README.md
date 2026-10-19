@@ -4,13 +4,14 @@ A private research workspace for finance, business, technology, and case studies
 
 ## What is included
 
-- 371 distinct seed resources across four domains, with descriptions, tags, access labels, and verification provenance. 100 sources were checked against official page content during catalog research; the remainder are explicitly labeled discovery seeds.
-- A chat interface with six built-in research use cases: company deep dives, SaaS pricing, competitive landscapes, AI in banking, market sizing, and startup failures. Follow-ups such as “only free sources” and “more case studies” refine the source recommendations.
+- 262 free seed resources across four domains, with descriptions, tags and verification provenance. The complete 371-entry catalog is retained for access classification; paid, mixed and freemium resources are excluded from browsing and recommendations.
+- A chat interface with six built-in research use cases: company deep dives, SaaS pricing, competitive landscapes, AI in banking, market sizing, and startup failures. All recommendations are free-only; follow-ups such as “more case studies” refine their relevance.
 - Weighted metadata retrieval over the catalog and captured page summaries. The initial version is key-free retrieval, not a connected generative language model. It does not invent article findings or pretend to have read uncrawled documents.
 - A server-side HTML/RSS/Atom crawler with persistent queues, graph edges, timestamps, logs, canonical URL deduplication within each run, pause/resume, bounded depth and page limits, robots checks, and host throttling.
 - A clearly labeled recorded example from a real crawl (35 public pages, 1,075 discovered URLs, 2,200 hyperlinks) demonstrates the spider in a fresh workspace.
 - A neutral, graph-first workspace with event-driven canvas rendering, real URL branching, replay, queue inspection, and keyboard pan/zoom.
-- Interactive source inspection, keyword/domain/access filters, bookmarks, custom sources, JSON database exports, and CSV catalog exports.
+- A dedicated Research results area across crawl runs, with search, stable pagination, purpose, practical reading guidance, research context, bookmarks, and access/provenance labels.
+- Source inspection, keyword/domain filters, custom URLs, JSON database exports, and CSV catalog exports.
 - Cloudflare D1 persistence and per-user authorization through Sites identity headers.
 
 ## Run locally
@@ -33,11 +34,11 @@ For subsequent schema changes, generate and apply each **new** migration in orde
 
 1. Ask a research question or pick a built-in use case.
 2. Inspect the suggested source links. Seed descriptions identify where to research; they are not case-study findings.
-3. Choose **Crawl these sources**, review the seed URLs, page budget, depth, and crawl boundary, then launch.
+3. Choose **Review & start crawl**, review the seed URLs, page budget, depth, and crawl boundary, then launch.
 4. Keep the workspace open while the crawl runs. The browser advances a durable server-side queue; closing the tab stops progress, and reopening resumes running jobs. Pause is available in the network view and crawl history.
-5. Explore captured metadata and links in the network or indexed-page table. Export source or crawl records when needed.
+5. Open **Results** or the completed crawl’s **View research results** button. Each free-source link explains its purpose and how to use it. Filter by crawl, search, save resources, or inspect the captured summary and context.
 
-No unattended schedule or paid API is enabled. Some catalog resources require a third-party subscription. Availability and access labels can change.
+No unattended schedule or paid API is enabled. Known paid, mixed and freemium seeds and destinations are blocked, and explicit payment or login gates are skipped. Custom public URLs may be crawled, but unmatched access is labeled Unknown and withheld from free results. Access is classified by destination URL and catalog path, not inherited from the starting source. Catalogued free access is not a guarantee that every full article is available. Historical data remains in the private archive.
 
 ## Crawl boundaries
 
@@ -53,14 +54,16 @@ npx tsc --noEmit
 npm run build
 ```
 
-Tests cover extraction, robots matching, URL checks, ownership, persistence, pause/resume, feed discovery, source retrieval, and conversation filters.
+Tests cover extraction, robots matching, URL checks, ownership, persistence, pause/resume, feed discovery, free-only policy, explicit paywalls, retrieval, explanatory guidance, stable results pagination beyond dashboard limits, and frame-rate-independent graph motion.
 
 ## Project structure
 
-- `app/page.tsx`, `app/graph.tsx`, `app/chat.tsx`: workspace UI
+- `app/page.tsx`, `app/graph.tsx`, `app/chat.tsx`, `app/results.tsx`: workspace UI
 - `app/api/`: same-origin, authenticated database/crawler/chat endpoints
 - `lib/crawler.ts`: crawling, extraction, queue, and persistence
 - `lib/research.ts`: metadata retrieval and research planning
+- `lib/results.ts`: owner-scoped research pagination and filters
+- `lib/free-access.ts`, `lib/resource-guide.ts`: access classification and metadata-based resource explanations
 - `lib/catalog.json`: source catalog with provenance
 - `db/schema.ts`, `drizzle/`: schema and migrations
 - `.openai/hosting.json`: Sites project identity and D1 binding (no secrets)

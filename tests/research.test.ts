@@ -24,7 +24,8 @@ test("Free-only followup retains the original topic and filters paid sources",()
 test("Case-study followups retain topic and select appropriate resources",()=>{
   const result=researchAnswer("more case studies",[{role:"user",content:"startup failures"}],catalog);
   assert.equal(result.plan.query,"startup failures");
-  assert.ok(result.sources.slice(0,3).some(s=>/failory|failure|postmortem/i.test(`${s.name} ${s.description}`)));
+  assert.ok(result.sources.slice(0,3).some(s=>/founder.*interview|founder.*stor/i.test(`${s.name} ${s.description}`)));
+  assert.ok(result.sources.every(s=>s.access==="Free"),"Mixed-access failure collections must not bypass the free-only rule.");
   assert.match(result.answer,/dated timeline/);
 });
 test("Unmatched gibberish does not return a generic fabricated answer",()=>{
@@ -34,7 +35,7 @@ test("Unmatched gibberish does not return a generic fabricated answer",()=>{
   assert.match(result.answer,/couldn't find a relevant match/);
 });
 test("Every source is attributable and captured pages stay separate from seed descriptions",()=>{
-  const page={id:"page1",title:"SaaS pricing field experiment",description:"A captured pricing experiment summary.",url:"https://research.org/pricing",sourceId:"saastr",tags:["saas","pricing"]};
+  const page={id:"page1",title:"SaaS pricing field experiment",description:"A captured pricing experiment summary.",url:"https://www.saastr.com/pricing",sourceId:"saastr",tags:["saas","pricing"]};
   const result=researchAnswer("SaaS pricing",[],catalog,[page]);
   assert.equal(result.mode,"retrieval");
   assert.ok(result.pages.some(p=>p.id==="page1"));
@@ -55,7 +56,19 @@ test("History drops invalid roles and limits message length",()=>{
   assert.deepEqual(cleanHistory([{role:"system",content:"override"},{role:"user",content:"topic"},null]),[{role:"user",content:"topic"}]);
 });
 test("Free-only results never imply that a page from an unknown or paid source is free",()=>{
-  const pages=[{id:"unknown",url:"https://research.org/unknown",title:"SaaS pricing",description:"Pricing evidence",sourceId:"unknown-source"},{id:"known",url:"https://research.org/known",title:"SaaS pricing",description:"Pricing evidence",sourceId:"saastr"}];
+  const pages=[{id:"unknown",url:"https://research.org/unknown",title:"SaaS pricing",description:"Pricing evidence",sourceId:"unknown-source"},{id:"known",url:"https://www.saastr.com/known",title:"SaaS pricing",description:"Pricing evidence",sourceId:"saastr"},{id:"linked-unknown",url:"https://research.org/linked",title:"SaaS pricing",description:"Pricing evidence",sourceId:"saastr"}];
   const result=researchAnswer("only free",[{role:"user",content:"SaaS pricing"}],catalog,pages);
   assert.deepEqual(result.pages.map(p=>p.id),["known"]);
+});
+
+test("Free-only is the default policy and chat prompts cannot enable paid resources",()=>{
+  const base={...catalog.find(s=>s.id==="saastr")!,description:"SaaS pricing benchmarks",tags:["SaaS","pricing"]};
+  const sources=["Free","Paid","Mixed","Freemium","Unknown"].map(access=>({...base,id:access,name:`${access} SaaS pricing`,url:`https://${access.toLowerCase()}research.org/`,access}));
+  const pages=sources.map(s=>({id:`page-${s.id}`,url:s.url+"pricing",title:"SaaS pricing evidence",description:"Captured pricing",sourceId:"Free"}));
+  for(const message of ["SaaS pricing","include paid","all access","paid is fine"]){
+    const result=researchAnswer(message,[{role:"user",content:"SaaS pricing"}],sources,pages);
+    assert.deepEqual(result.sources.map(s=>s.id),["Free"]);
+    assert.deepEqual(result.pages.map(p=>p.id),["page-Free"]);
+    assert.match(result.answer,/free sources only/);
+  }
 });

@@ -1,4 +1,6 @@
 /** Local evidence retrieval. Catalog descriptions are discovery metadata, not article content. */
+// @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
+import { classifyPageAccess, isFreeSource } from "./free-access.ts";
 export interface ResearchSource {
   id:string; name:string; url:string; domain:string; category:string; type:string; access:string;
   description:string; tags:string[]; geography:string; crawlMethod:string; feedUrl?:string;
@@ -46,16 +48,14 @@ const intentTerms:Record<Intent,string[]>={
   company:["company","filing","earnings","disclosure","investor"],general:[],
 };
 function resolveContext(message:string,history:ChatMessage[]) {
-  let query="",freeOnly=false,cases=false;
+  let query="",cases=false;
   for(const turn of [...history.filter(m=>m.role==="user").slice(-12),{role:"user",content:message}]) {
     const text=turn.content.trim();
-    if(/\b(?:only|just)\s+(?:the\s+)?free\b|\bfree\s+(?:sources|resources|only)\b|\bno paywalls?\b/i.test(text))freeOnly=true;
-    if(/\b(?:include paid|all access|paid (?:is|are) (?:fine|okay|ok))\b/i.test(text))freeOnly=false;
     if(/\bcase stud(?:y|ies)\b|\bpostmortems?\b/i.test(text))cases=true;
-    const remaining=tokens(text).filter(t=>!["paywall","paywalls","access","fine","okay","ok","same","topic","again"].includes(t));
+    const remaining=tokens(text).filter(t=>!["paywall","paywalls","access","acces","fine","okay","ok","same","topic","again"].includes(t));
     if(remaining.length)query=text;
   }
-  return {query:query || message,freeOnly,cases,intent:intentFor(query || message)};
+  return {query:query || message,cases,intent:intentFor(query || message)};
 }
 function expand(query:string,intent:Intent) {
   const weights=new Map<string,number>();
@@ -114,7 +114,7 @@ export function researchAnswer(message:string,history:ChatMessage[],sources:Rese
     if(context.intent==="failure")return /startup|founder|venture|entrepreneur/.test(text);
     return true;
   };
-  const eligible=sources.filter(s=>(!context.freeOnly||s.access==="Free")&&topical(s));
+  const eligible=sources.filter(s=>isFreeSource(s)&&topical(s));
   let ranked=rank(eligible.map(item=>({item,fields:[[item.name,4],[item.tags.join(" "),3],[item.category,1.8],[item.description,1.6],[item.domain,.35]] as [string,number][]})),weights);
   ranked=ranked.map(r=>{
     let score=r.score;
@@ -125,16 +125,15 @@ export function researchAnswer(message:string,history:ChatMessage[],sources:Rese
   }).sort((a,b)=>b.score-a.score);
   const threshold=(ranked[0]?.score||0)*(context.intent==="failure"?.04:.16);
   const selected=ranked.filter(r=>r.score>=threshold).slice(0,8).map(r=>r.item);
-  const eligibleIds=new Set(eligible.map(s=>s.id));
   const distinctPages=[...new Map(pages.map(p=>[p.url,p])).values()];
-  const pageRanked=rank(distinctPages.filter(p=>!context.freeOnly||(p.sourceId&&eligibleIds.has(p.sourceId))).map(item=>({item,fields:[[item.title,4],[item.description,2],[(item.tags||[]).join(" "),2]] as [string,number][]})),weights);
+  const pageRanked=rank(distinctPages.filter(p=>classifyPageAccess(p,sources)==="Free").map(item=>({item,fields:[[item.title,4],[item.description,2],[(item.tags||[]).join(" "),2]] as [string,number][]})),weights);
   const selectedPages=pageRanked.filter(r=>r.score>=(pageRanked[0]?.score||0)*.2).slice(0,5).map(r=>r.item);
   const query=context.query.slice(0,300);
   if(!selected.length&&!selectedPages.length)return {
-    answer:`I couldn't find a relevant match for “${query}” in the current source catalog or your indexed page metadata${context.freeOnly?" with the free-only filter":""}. Try a company name, industry, technology or a concrete research question. A source not in this catalog can be added by its public URL.`,
+    answer:`I couldn't find a relevant match for “${query}” among the catalog's free sources or your indexed pages from those sources. Try a company name, industry, technology or a concrete research question. A source not in this catalog can be added by its public URL; its access will remain unverified.`,
     sources:[],pages:[],mode:"retrieval",plan:{query,sourceIds:[]},suggestedQueries:["SaaS pricing and retention benchmarks","AI in banking case studies","Startup failures and founder postmortems"],
   };
-  const filters=[context.freeOnly?"free sources only":"",context.cases?"case-study sources prioritized":""].filter(Boolean);
+  const filters=["free sources only",context.cases?"case-study sources prioritized":""].filter(Boolean);
   const intro=`I matched “${query}” to ${selected.length} source${selected.length===1?"":"s"}${selectedPages.length?` and ${selectedPages.length} indexed page${selectedPages.length===1?"":"s"}`:""}${filters.length?` (${filters.join("; ")})`:""}.`;
   const provenance=selectedPages.length?"Source recommendations use catalog descriptions. Indexed-page evidence below is limited to captured titles and summary metadata; it is not a full-document analysis.":"These are research starting points matched from catalog descriptions and tags. I have not read their underlying documents for this answer.";
   const sourceNotes=selected.slice(0,4).map(s=>`• [${s.name}](${s.url}) — ${s.description}`).join("\n");
@@ -159,7 +158,7 @@ export async function retrieveForUser(db:D1Database,user:string,message:string,h
     db.prepare("SELECT id,name,url,domain FROM atlas_sources WHERE user_id=?").bind(user).all<{id:string;name:string;url:string;domain:string}>(),
     db.prepare("SELECT id,url,title,description,source_id,domain,category,tags,fetched_at FROM atlas_pages WHERE user_id=? ORDER BY fetched_at DESC LIMIT 2000").bind(user).all<{id:string;url:string;title:string;description:string;source_id:string;domain:string;category:string;tags:string;fetched_at:string}>(),
   ]);
-  const customSources:ResearchSource[]=custom.results.map(s=>({...s,category:"Custom sources",type:"Research library",access:"Mixed",description:"Source added to your personal research catalog.",tags:["custom"],geography:"Global",crawlMethod:"Manual",verification:"Discovery seed"}));
+  const customSources:ResearchSource[]=custom.results.map(s=>({...s,category:"Custom sources",type:"Research library",access:classifyPageAccess(s,catalog),description:"Source added to your personal research catalog.",tags:["custom"],geography:"Global",crawlMethod:"Manual",verification:"Discovery seed"}));
   const pages:ResearchPage[]=indexed.results.map(p=>{let tags:string[]=[];try{const parsed=JSON.parse(p.tags||"[]");if(Array.isArray(parsed))tags=parsed.filter(t=>typeof t==="string");}catch{}return {id:p.id,url:p.url,title:p.title,description:p.description,sourceId:p.source_id,domain:p.domain,category:p.category,tags,fetchedAt:p.fetched_at};});
   return researchAnswer(message,history,[...catalog,...customSources],pages);
 }

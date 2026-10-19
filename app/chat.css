@@ -241,3 +241,5 @@
   .research-chat button { transition: none; }
   .research-chat .rc-spin { animation: none; }
 }
+
+.rc-evidence-card{align-items:flex-start}.rc-evidence-card>div{min-width:0}.rc-evidence-card .rc-resource-purpose,.rc-page-evidence .rc-resource-purpose{font-size:11px;line-height:1.7;color:#9daea3;margin:10px 0 0}.rc-resource-use{margin-top:10px;font-size:10px;color:#a6c4b3}.rc-resource-use summary{cursor:pointer;line-height:1.7}.rc-resource-use p{font-size:11px;color:#a0b0a5;line-height:1.75;margin:9px 0 0}.rc-page-evidence>div{padding:10px 0;border-bottom:1px solid #303b33}.rc-page-evidence>div:last-child{border:0}.rc-page-evidence>div>a{display:flex;align-items:center;gap:8px;font-size:12px;line-height:1.6;color:#c9d9ce}.rc-results-link{display:flex;align-items:center;width:100%;gap:10px;border:1px solid #3a4e41;background:#1b2920;border-radius:6px;padding:13px;text-align:left;color:#c5dece;margin-bottom:22px;font-size:11px}.rc-results-link>span{flex:1}.rc-results-link small{display:block;font-size:9px;color:#8fa99a;margin-top:6px;line-height:1.5}.rc-results-link:hover{background:#24352a}

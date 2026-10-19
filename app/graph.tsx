@@ -1,5 +1,6 @@
 'use client';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import {classifyPageAccess} from '../lib/free-access';
 import GraphLayoutWorker from './graph-layout.worker?worker';
 import { GraphMotion, hashPhase, stepSpring, type Spring } from './graph-motion';
 
@@ -38,7 +39,7 @@ function buildScene(sources:Source[],pages:PageRecord[],edges:CrawlEdge[],fronti
     const title=record?.title||record?.name||(namedUrls.has(key)?source?.name:undefined)||shortUrl(url);
     const id=record?.id||existing?.id||`discovered:${key}`;
     const status=indexed?'indexed':record?.status||existing?.status||'discovered';
-    const resource:Source={id,sourceId:record?.sourceId||source?.id,name:title,url,domain:record?.domain||source?.domain||'Research',category:record?.category||source?.category||'Crawled links',type:indexed?'Indexed page':'Discovered URL',access:source?.access||'Mixed',description:record?.description||(indexed?'Metadata captured from this page.':'URL discovered by the crawler; page content has not been indexed.'),tags:record?.tags||[],geography:source?.geography||'Global',crawlMethod:source?.crawlMethod||'Manual',verification:indexed?'Crawled':status==='processing'?'Fetching':status==='blocked'?'Blocked':'Discovered'};
+    const resource:Source={...(record?.jobId?{jobId:record.jobId}:{}),id,sourceId:record?.sourceId||source?.id,name:title,url,domain:record?.domain||source?.domain||'Research',category:record?.category||source?.category||'Crawled links',type:indexed?'Indexed page':'Discovered URL',access:classifyPageAccess({url},sources),description:record?.description||(indexed?'Metadata captured from this page.':'URL discovered by the crawler; page content has not been indexed.'),tags:record?.tags||[],geography:source?.geography||'Global',crawlMethod:source?.crawlMethod||'Manual',verification:indexed?'Crawled':status==='processing'?'Fetching':status==='blocked'?'Blocked':'Discovered'};
     const node:Node={key,id,label:title,url,x:0,y:0,depth:0,root:false,status,resource};
     nodes.set(key,node);if(record?.depth===0&&!record.parentUrl)suggestedRoots.add(key);
     return node;
@@ -177,8 +178,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
       const started=performance.now(),seconds=lastTime?Math.min(.1,(now-lastTime)/1000):1/60;lastTime=now;
       const {width:w,height:h}=size.current,{nodes,lines}=sceneRef.current,bounds=layoutSceneRef.current.bounds;
       let moving=motion.current.advance(seconds,now,reducedMotion);
-      const horizontalSpread=1.55;
-      const fit=Math.max(.03,Math.min((w-100)/(Math.max(140,bounds.right-bounds.left)*horizontalSpread),(h-120)/Math.max(140,bounds.bottom-bounds.top),1.6));
+      const fit=Math.max(.03,Math.min((w-100)/Math.max(140,bounds.right-bounds.left),(h-120)/Math.max(140,bounds.bottom-bounds.top),1.6));
       moving=stepSpring(camera.x,(bounds.left+bounds.right)/2,seconds,reducedMotion||!cameraReady)||moving;
       moving=stepSpring(camera.y,(bounds.top+bounds.bottom)/2,seconds,reducedMotion||!cameraReady)||moving;
       moving=stepSpring(camera.scale,fit,seconds,reducedMotion||!cameraReady,.00002)||moving;cameraReady=true;
@@ -191,7 +191,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
         const amplitude=node.root?0:activity.value*(node.status==='indexed'?2.3:5.5);
         const dx=amplitude*(Math.sin(flowTime*.72+point.branchPhase)+Math.sin(flowTime*1.1+point.phase)*.3);
         const dy=amplitude*(Math.cos(flowTime*.63+point.branchPhase)+Math.sin(flowTime*.9+point.phase)*.3);
-        points.set(node.key,{node,x:w/2+offset.current.x+(point.x.value-camera.x.value)*scale*horizontalSpread+dx,y:h/2+offset.current.y+(point.y.value-camera.y.value)*scale+dy,alpha:point.alpha});
+        points.set(node.key,{node,x:w/2+offset.current.x+(point.x.value-camera.x.value)*scale+dx,y:h/2+offset.current.y+(point.y.value-camera.y.value)*scale+dy,alpha:point.alpha});
       }
       rendered.current=[...points.values()].filter(p=>p.alpha>.15&&p.x>-20&&p.x<w+20&&p.y>-20&&p.y<h+20);
       const focus=nodes.find(n=>n.id===selectedRef.current||n.key===selectedRef.current||n.url===selectedRef.current)?.key||hoverRef.current;

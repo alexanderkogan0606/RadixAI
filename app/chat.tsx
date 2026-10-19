@@ -3,6 +3,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUp, ArrowUpRight, BookOpen, Building2, ChevronDown, ChevronRight, CircleHelp, Database, FileText, Layers3, LoaderCircle, MessageSquare, RefreshCw, ScanSearch, Search, ShieldCheck, Sparkles, TrendingUp, TriangleAlert, Waypoints } from 'lucide-react';
 import type { Source } from './graph';
+import {resourceGuide} from '../lib/resource-guide';
+import {classifyPageAccess,isFreeSource} from '../lib/free-access';
+import catalog from '../lib/catalog.json';
 import Graph from './graph';
 import './chat.css';
 
@@ -31,6 +34,7 @@ type ResearchChatProps = {
   onCrawl: (ids: string[], query: string) => void;
   onInspect: (source: Source) => void;
   onRefresh: () => void;
+  onResults: () => void;
 };
 
 const useCases = [
@@ -85,7 +89,7 @@ const Answer = memo(function Answer({ content, sources = emptySources }: { conte
   })}</div>;
 });
 
-export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRefresh }: ResearchChatProps) {
+export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRefresh, onResults }: ResearchChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [pending, setPending] = useState(false);
@@ -112,7 +116,7 @@ export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRef
     requestRef.current.then(data => {
       if (!active) return;
       const saved = Array.isArray(data.messages) ? data.messages.filter(message => ['user', 'assistant'].includes(message.role) && typeof message.content === 'string') : [];
-      setMessages(saved);
+      setMessages(saved.map(message=>{if(message.role!=='assistant')return message;const allowed=(message.sources||[]).filter(isFreeSource);const restricted=allowed.length!==(message.sources||[]).length;return {...message,content:restricted?'This earlier answer included sources outside your free-only filter. Ask the question again for updated free recommendations.':message.content,sources:allowed,pages:(message.pages||[]).filter(page=>classifyPageAccess(page,catalog)==='Free'),plan:message.plan?{...message.plan,sourceIds:message.plan.sourceIds.filter(id=>sources.some(source=>source.id===id))}:undefined}}));
     }).catch(cause => { if (active) setHistoryError(cause.message || 'Saved conversation could not be loaded.'); }).finally(() => { if (active) setLoadingHistory(false); });
     return () => { active = false; };
   }, []);
@@ -167,12 +171,12 @@ export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRef
   }
 
   function crawlPlan(plan?: ResearchPlan) {
-    if (plan?.sourceIds?.length) onCrawl(plan.sourceIds, plan.query);
+    if (plan?.sourceIds?.length) onCrawl(plan.sourceIds.filter(id=>sources.some(source=>source.id===id)), plan.query);
   }
 
   return <div className="research-chat">
     <section className="rc-conversation" aria-label="Research assistant conversation">
-      <div className="rc-panel-top"><span><MessageSquare size={16}/>Research assistant</span><span className="rc-private">Saved to this workspace</span></div>
+      <div className="rc-panel-top"><span><MessageSquare size={16}/>Research assistant</span><span className="rc-private">Free sources · Saved to this workspace</span></div>
       <div className="rc-transcript" role="log" aria-label="Research messages" aria-live="polite" aria-busy={pending || loadingHistory}>
         {loadingHistory ? <div className="rc-history-loading"><LoaderCircle size={18} className="rc-spin"/><span>Loading conversation…</span></div> : !messages.length ? <div className="rc-welcome">
           <h2>What are you researching?</h2>
@@ -189,11 +193,11 @@ export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRef
               {!!message.sources?.length && <div className="rc-evidence">
                 <div className="rc-evidence-title"><BookOpen size={13}/>Sources<span>{message.sources.length}</span></div>
                 <div className="rc-evidence-grid">{message.sources.slice(0, 6).map((source, sourceIndex) => <div className="rc-evidence-card" key={source.id}>
-                  <span className="rc-evidence-number">{sourceIndex + 1}</span><div><a href={safeHref(source.url)} target="_blank" rel="noreferrer" title={source.url}>{source.name}<ArrowUpRight size={12}/></a><small>{hostname(source.url)}<span>{source.access}</span></small></div><button aria-label={`Inspect ${source.name}`} onClick={() => onInspect(source)}>Inspect</button>
+                  <span className="rc-evidence-number">{sourceIndex + 1}</span><div><a href={safeHref(source.url)} target="_blank" rel="noreferrer" title={source.url}>{source.name}<ArrowUpRight size={12}/></a><small>{hostname(source.url)}<span>{source.access}</span></small><p className="rc-resource-purpose">{resourceGuide(source,{query:message.plan?.query,origin:'catalog'}).purpose}</p><details className="rc-resource-use"><summary>How to use this source</summary><p>{resourceGuide(source,{query:message.plan?.query,origin:'catalog'}).howToUse}</p></details></div><button aria-label={`Inspect ${source.name}`} onClick={() => onInspect(source)}>Inspect</button>
                 </div>)}</div>
                 {message.sources.length > 6 && <button className="rc-more-sources" onClick={() => setSelectedIndex(index)}>View all {message.sources.length} sources</button>}
               </div>}
-              {!!message.pages?.length && <div className="rc-page-evidence"><span><FileText size={13}/>Captured pages</span>{message.pages.slice(0, 3).map((page, pageIndex) => <a key={page.id || page.url || pageIndex} href={safeHref(page.url)} target="_blank" rel="noreferrer">{page.title || hostname(page.url)}<ArrowUpRight size={12}/></a>)}</div>}
+              {!!message.pages?.length && <div className="rc-page-evidence"><span><FileText size={13}/>Captured pages</span>{message.pages.slice(0, 3).map((page, pageIndex) => <div key={page.id || page.url || pageIndex}><a href={safeHref(page.url)} target="_blank" rel="noreferrer">{page.title || hostname(page.url)}<ArrowUpRight size={12}/></a><p className="rc-resource-purpose">{resourceGuide(page,{query:message.plan?.query,origin:'page'}).purpose}</p><details className="rc-resource-use"><summary>How to use this page</summary><p>{resourceGuide(page,{query:message.plan?.query,origin:'page'}).howToUse}</p></details></div>)}</div>}
               {!!message.plan?.sourceIds?.length && <div className="rc-message-actions"><button onClick={() => { setSelectedIndex(index); crawlPlan(message.plan); }}>Review & start crawl</button><button className="rc-brief-link" onClick={() => setSelectedIndex(index)}>View research brief</button></div>}
             </article>;
           })}
@@ -209,13 +213,13 @@ export default function ResearchChat({ sources, pages, onCrawl, onInspect, onRef
           <textarea ref={textareaRef} aria-label="Ask a research question" placeholder="Ask a research question…" rows={2} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendMessage(draft); } }} disabled={pending || loadingHistory}/>
           <div className="rc-composer-bottom"><span><Database size={13}/>Your research library</span><button type="submit" disabled={!draft.trim() || pending || loadingHistory} aria-label={pending ? 'Sending research question' : 'Send research question'}>{pending ? <LoaderCircle size={17} className="rc-spin"/> : <ArrowUp size={18}/>}</button></div>
         </form>
-        <div className="rc-compose-note"><span>Searches source descriptions and collected page summaries.</span><span><kbd>Enter</kbd> to send <span>·</span> <kbd>Shift Enter</kbd> for a new line</span></div>
+        <div className="rc-compose-note"><span>Searches free source descriptions and captured summaries.</span><span><kbd>Enter</kbd> to send <span>·</span> <kbd>Shift Enter</kbd> for a new line</span></div>
       </div>
     </section>
 
     <aside className="rc-brief" aria-label="Research brief">
       <div className="rc-panel-top"><span>Research brief</span><span className="rc-brief-state">{selectedMessage ? 'Ready' : 'Overview'}</span></div>
-      <div className="rc-brief-body">
+      <div className="rc-brief-body"><button className="rc-results-link" onClick={onResults}><FileText size={15}/><span>Open research results<small>All collected links and how to use them</small></span><ArrowUpRight size={14}/></button>
         <div className="rc-brief-intro"><h3>{selectedPlan ? 'Current question' : 'Your research workspace'}</h3><p>{selectedPlan?.query || 'Find relevant sources, capture useful pages, and keep the evidence connected to your question.'}</p></div>
         <div className="rc-brief-stats"><div><strong>{(selectedMessage ? visibleSources.length : sources.length).toLocaleString()}</strong><span>{selectedMessage ? 'Sources found' : 'Sources'}</span></div><div><strong>{(selectedMessage ? selectedPages.length : pages.length).toLocaleString()}</strong><span>{selectedMessage ? 'Related pages' : 'Captured pages'}</span></div><div><strong>{selectedMessage ? planSources.length : domainCounts.length}</strong><span>{selectedMessage ? 'Crawl sources' : 'Domains'}</span></div></div>
         {selectedMessage ? <>

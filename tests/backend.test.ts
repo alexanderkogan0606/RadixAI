@@ -96,7 +96,7 @@ test("D1 integration: feed discovery, persistent queue, pause/resume, ownership,
     return new Response(`<title>Banking paper</title><meta name="description" content="Evidence on banking"><a href="/a">Self</a>`,{headers:{"content-type":"text/html"}});
   }) as typeof fetch;
   try {
-    const created=await createJob(db,"alice",{query:"Banking",sourceIds:["feed"],maxPages:5,maxDepth:1,scope:"same-domain"},[{id:"feed",name:"Feed",url:"https://publicresearch.org/",feedUrl:"https://feeds.publicresearch.org/rss",domain:"Finance",category:"Academic research"}]);
+    const created=await createJob(db,"alice",{query:"Banking",sourceIds:["feed"],maxPages:5,maxDepth:1,scope:"same-domain"},[{id:"feed",name:"Feed",url:"https://publicresearch.org/",feedUrl:"https://feeds.publicresearch.org/rss",domain:"Finance",category:"Academic research",access:"Free"}]);
     const id=String(created.job.id);
     assert.equal(created.job.queued,1);
     await assert.rejects(()=>stepJob(db,"bob",id),/not found/);
@@ -131,6 +131,7 @@ test("D1 integration: feed discovery, persistent queue, pause/resume, ownership,
     assert.deepEqual((await readState(db,"alice")).bookmarks,[]);
     await addSource(db,"alice",{name:"AI reports",url:"https://research.org/",domain:"unsupported"});
     assert.equal((await readState(db,"alice")).customSources[0].domain,"Technology");
+    assert.equal((await readState(db,"alice")).customSources[0].access,"Unknown");
     assert.deepEqual((await readState(db,"bob")).customSources,[]);
   } finally {globalThis.fetch=originalFetch;sqlite.close();}
 });
@@ -146,9 +147,93 @@ test("D1 integration: X-Robots-Tag nofollow prevents queue expansion and custom 
     assert.equal(result.job.status,"completed");
     const state=await readState(db,"alice");
     assert.equal(state.pages[0].domain,"Technology");
+    assert.equal(state.pages[0].access,"Unknown","A successful custom-URL fetch must not imply verified free access.");
     assert.equal(state.edges.length,0);
     assert.equal(researchDomain(undefined,"Case studies on banks"),"Case studies");
   } finally {globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("New crawls reject non-free catalog IDs and paid URLs, including saved custom aliases",async()=>{
+  const {db,sqlite}=testDatabase();
+  const catalog=[
+    ...["Paid","Mixed","Freemium",undefined].map((access,i)=>({id:`restricted-${i}`,name:`Restricted ${i}`,url:`https://restricted${i}.org/`,domain:"Business",access})),
+    {id:"free",name:"Open reports",url:"https://restricted0.org/open",domain:"Business",access:"Free"},
+  ];
+  try{
+    for(const source of catalog.slice(0,4))await assert.rejects(()=>createJob(db,"alice",{sourceIds:[source.id]},catalog),/not listed as Free/);
+    for(const host of ["restricted0.org","www.restricted1.org","restricted2.org"])await assert.rejects(()=>createJob(db,"alice",{urls:[`https://${host}/article`]},catalog),/paid or mixed-access/);
+    const alias=await addSource(db,"alice",{name:"Saved paid site",url:"https://restricted0.org/article"});
+    await assert.rejects(()=>createJob(db,"alice",{sourceIds:[alias.source.id]},catalog),/paid or mixed access/);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_jobs").get()?.n),0,"Rejected starts must not create jobs or queues.");
+    const free=await createJob(db,"alice",{sourceIds:["free"]},catalog);
+    assert.equal(free.job.queued,1,"A known free subpath can be selected on a mixed-access host.");
+    const custom=await addSource(db,"alice",{name:"Public custom resource",url:"https://publicresearch.org/"});
+    assert.equal(custom.source.access,"Unknown");
+    const unknown=await createJob(db,"alice",{sourceIds:[custom.source.id]},catalog);
+    assert.equal(unknown.job.queued,1,"Unknown custom resources may be checked without claiming they are verified free.");
+    const direct=await createJob(db,"alice",{urls:["https://publicresearch.org/report"]},catalog);
+    assert.equal(direct.job.queued,1);
+  }finally{sqlite.close();}
+});
+
+test("Crawler skips explicit paywalls before indexing or following their links",async()=>{
+  const originalFetch=globalThis.fetch;
+  const examples=[
+    {status:402,body:"Payment required"},
+    {status:401,body:"Sign in required"},
+    {status:200,body:`<script type="application/ld+json">{"@type":"Article","isAccessibleForFree":false}</script>`},
+    {status:200,body:"<h1>Subscribe to continue reading</h1>"},
+    {status:200,body:"<h1>Report</h1><p>Sign in to read this article</p>"},
+  ];
+  try{
+    for(const example of examples){
+      const {db,sqlite,cacheRobots}=testDatabase();cacheRobots("publicresearch.org");
+      globalThis.fetch=(async()=>new Response(example.body+`<a href="/next">Next</a>`,{status:example.status,headers:{"content-type":"text/html"}})) as typeof fetch;
+      try{
+        const created=await createJob(db,"alice",{urls:["https://publicresearch.org/"],maxPages:5,maxDepth:1},[]);
+        const result=await stepJob(db,"alice",String(created.job.id));
+        assert.equal(result.job.status,"completed");assert.equal(result.job.indexed,0);assert.equal(result.job.errors,1);
+        const state=await readState(db,"alice");
+        assert.equal(state.pages.length,0);assert.equal(state.edges.length,0);assert.equal(state.frontier[0].status,"skipped");
+        assert.ok(state.events.some(event=>event.level==="skipped"&&/not indexed/i.test(String(event.message))));
+      }finally{sqlite.close();}
+    }
+  }finally{globalThis.fetch=originalFetch;}
+});
+
+test("Public articles with newsletter subscriptions and ordinary sign-in links remain crawlable",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;
+  cacheRobots("publicresearch.org");
+  globalThis.fetch=(async()=>new Response(`<h1>Open research</h1><p>A public report.</p><aside>Subscribe to our newsletter</aside><a href="/login">Sign in</a>`,{headers:{"content-type":"text/html"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{urls:["https://publicresearch.org/"],maxDepth:0},[]);
+    const result=await stepJob(db,"alice",String(created.job.id));
+    assert.equal(result.job.indexed,1);assert.equal(result.job.errors,0);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Known paid redirect destinations and linked pages are never fetched",async()=>{
+  const originalFetch=globalThis.fetch;
+  const catalog=[{id:"paid",name:"Paid publisher",url:"https://paidresearch.org/",domain:"Finance",access:"Paid"}];
+  try{
+    for(const redirect of [true,false]){
+      const {db,sqlite,cacheRobots}=testDatabase();cacheRobots("publicresearch.org");
+      const requested:string[]=[];
+      globalThis.fetch=(async(input:RequestInfo|URL)=>{
+        requested.push(String(input));
+        return redirect?new Response(null,{status:302,headers:{location:"https://paidresearch.org/article"}}):new Response(`<h1>Public study</h1><a href="https://paidresearch.org/article">Paid report</a>`,{headers:{"content-type":"text/html"}});
+      }) as typeof fetch;
+      try{
+        const created=await createJob(db,"alice",{urls:["https://publicresearch.org/"],maxPages:5,maxDepth:1,scope:"linked-domains"},catalog);
+        await stepJob(db,"alice",String(created.job.id),catalog);
+        if(!redirect)await stepJob(db,"alice",String(created.job.id),catalog);
+        assert.deepEqual(requested,["https://publicresearch.org/"]);
+        const state=await readState(db,"alice");
+        assert.equal(state.pages.length,redirect?0:1);
+        assert.ok(state.events.some(event=>event.level==="skipped"&&/paid or mixed-access/.test(String(event.message))));
+      }finally{sqlite.close();}
+    }
+  }finally{globalThis.fetch=originalFetch;}
 });
 
 test("Full export crosses keyset batches, excludes other users, and counts and saved pages exceed UI caps",async()=>{

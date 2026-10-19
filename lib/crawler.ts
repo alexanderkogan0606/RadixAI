@@ -1,6 +1,9 @@
 /** Research Atlas indexes public metadata. It never stores fetched HTML or acts as a proxy. */
+import defaultCatalog from "./catalog.json" with { type:"json" };
+// @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
+import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl } from "./free-access.ts";
 export interface CatalogSource {
-  id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string;
+  id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string; access?:string;
 }
 type Row = Record<string, unknown>;
 type DB = D1Database;
@@ -173,10 +176,10 @@ export function publicJob(row: Row): Row {
   return {id:row.id,query:row.query,status:row.status,scope:row.scope,maxPages:row.max_pages,maxDepth:row.max_depth,processed:row.processed,indexed:row.indexed,errors:row.errors,queued:row.queued || 0,createdAt:row.created_at,updatedAt:row.updated_at};
 }
 function publicPage(row:Row):Row {
-  return {id:row.id,url:row.url,title:row.title,description:row.description,domain:row.domain,category:row.category,sourceId:row.source_id,jobId:row.job_id,depth:row.depth,parentUrl:row.parent_url,fetchedAt:row.fetched_at,status:row.status,tags:JSON.parse(String(row.tags || "[]"))};
+  return {id:row.id,url:row.url,title:row.title,description:row.description,domain:row.domain,category:row.category,sourceId:row.source_id,jobId:row.job_id,depth:row.depth,parentUrl:row.parent_url,fetchedAt:row.fetched_at,status:row.status,access:classifyPageAccess({url:String(row.url)},defaultCatalog),tags:JSON.parse(String(row.tags || "[]"))};
 }
 function customSource(row:Row):Row {
-  return {id:row.id,name:row.name,url:row.url,domain:row.domain,category:"Custom sources",type:"Research library",access:"Mixed",description:"Source added to your personal research catalog.",tags:["custom"],geography:"Global",crawlMethod:"Manual",verification:"Discovery seed",provenanceUrl:null,createdAt:row.created_at};
+  return {id:row.id,name:row.name,url:row.url,domain:row.domain,category:"Custom sources",type:"Research library",access:classifyPageAccess({url:String(row.url)},defaultCatalog),description:"Source added to your personal research catalog.",tags:["custom"],geography:"Global",crawlMethod:"Manual",verification:"Discovery seed",provenanceUrl:null,createdAt:row.created_at};
 }
 async function getJob(db:DB,user:string,id:string) {
   const row = await first(db,"SELECT j.*, (SELECT count(*) FROM atlas_queue q WHERE q.job_id=j.id AND q.status IN ('queued','processing')) AS queued FROM atlas_jobs j WHERE j.id=? AND j.user_id=?",id,user);
@@ -269,13 +272,20 @@ export async function createJob(db:DB,user:string,input:Row,catalog:CatalogSourc
   const urls = Array.isArray(input.urls) ? [...new Set(input.urls.map(v=>safeUrl(v)))] : [];
   if (ids.length + urls.length > 30) throw new ApiError("Choose up to 30 starting sources or URLs per crawl.");
   const custom = await all(db,"SELECT * FROM atlas_sources WHERE user_id=?",user);
+  const catalogIds=new Set(catalog.map(source=>source.id));
+  const accessCatalog=[...catalog,...defaultCatalog];
   const sourceMap = new Map<string,CatalogSource>([...catalog,...custom.map((r):CatalogSource=>({id:String(r.id),name:String(r.name),url:String(r.url),domain:String(r.domain),category:"Custom sources"}))].map(s=>[s.id,s]));
   const seeds: {source:CatalogSource;url:string}[] = [];
   for (const id of ids) {
     const source = sourceMap.get(id); if (!source) throw new ApiError("A selected source is no longer available.");
+    if(catalogIds.has(id)&&!isFreeSource(source))throw new ApiError(`${source.name} is not listed as Free. Choose a free source.`);
+    if(isKnownRestrictedUrl(source.url,accessCatalog)||isKnownRestrictedUrl(source.feedUrl||source.url,accessCatalog))throw new ApiError(`${source.name} requires paid or mixed access. Choose a free source.`);
     seeds.push({source,url:safeUrl(source.feedUrl || source.url)});
   }
-  for (const url of urls) seeds.push({source:{id:"url:"+new URL(url).hostname,name:new URL(url).hostname,url,domain:researchDomain(input.domain,query),category:"Custom sources"},url});
+  for (const url of urls) {
+    if(isKnownRestrictedUrl(url,accessCatalog))throw new ApiError("This URL belongs to a paid or mixed-access source. Choose a free source or another public URL.");
+    seeds.push({source:{id:"url:"+new URL(url).hostname,name:new URL(url).hostname,url,domain:researchDomain(input.domain,query),category:"Custom sources",access:classifyPageAccess({url},accessCatalog)},url});
+  }
   if (!seeds.length) throw new ApiError("Select at least one source or enter a starting URL.");
   const id = uid(), time = now(), seedHosts = [...new Set(seeds.flatMap(s=>[new URL(s.url).hostname,new URL(safeUrl(s.source.url)).hostname]))];
   const active = await first(db,"SELECT count(*) AS total FROM atlas_jobs WHERE user_id=? AND status IN ('running','paused')",user);
@@ -318,10 +328,11 @@ async function responseText(response:Response):Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
-async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains"):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean}> {
+async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean}> {
   let current = safeUrl(url);
   for (let redirects=0;redirects<=3;redirects++) {
     if (!robots && !inScope(current,seedHosts,scope)) throw new CrawlSkipped("Redirect leaves the selected crawl scope.");
+    if(!robots&&isKnownRestrictedUrl(current,catalog))throw new CrawlSkipped("Known paid or mixed-access destination skipped by the free-only policy.");
     const hostState=!robots ? await checkRobots(db,current) : undefined;
     await reserveHost(db,new URL(current).hostname,hostState);
     const response = await fetch(current,{redirect:"manual",signal:AbortSignal.timeout(8000),headers:{"User-Agent":`${BOT}/1.0 (public research metadata; respects robots.txt)`,Accept:robots?"text/plain":"text/html,application/rss+xml,application/atom+xml,application/xml;q=0.8"}});
@@ -362,7 +373,7 @@ async function checkRobots(db:DB,url:string) {
   return row || undefined;
 }
 
-export async function stepJob(db:DB,user:string,id:string) {
+export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[]=defaultCatalog) {
   const job = await getJob(db,user,id);
   if (job.status !== "running") return {job:publicJob(job)};
   const lease = await statement(db,"UPDATE atlas_jobs SET lease_until=? WHERE id=? AND user_id=? AND status='running' AND lease_until<?",Date.now()+90_000,id,user,Date.now()).run();
@@ -376,7 +387,9 @@ export async function stepJob(db:DB,user:string,id:string) {
     }
     item = await first(db,"UPDATE atlas_queue SET status='processing' WHERE id=(SELECT id FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued' ORDER BY depth,created_at,id LIMIT 1) RETURNING *",id,user);
     if (!item) { await finishJob(db,user,id,"All discovered URLs have been processed."); return {job:publicJob(await getJob(db,user,id))}; }
-    const fetched = await fetchText(db,String(item.url),false,JSON.parse(String(job.seed_hosts)),String(job.scope));
+    const fetched = await fetchText(db,String(item.url),false,JSON.parse(String(job.seed_hosts)),String(job.scope),catalog);
+    const accessGate=detectPaywall(fetched.body,fetched.status,fetched.contentType);
+    if(accessGate)throw new CrawlSkipped(accessGate);
     if ([401,403,429].includes(fetched.status)) throw new CrawlBlocked(`Source returned HTTP ${fetched.status}; access restrictions were respected.`);
     if (fetched.status < 200 || fetched.status >= 300) throw new Error(`Source returned HTTP ${fetched.status}.`);
     const robotMetas = [...fetched.body.matchAll(/<meta\b[^>]*>/gi)].map(m=>attrs(m[0]))
@@ -384,6 +397,7 @@ export async function stepJob(db:DB,user:string,id:string) {
     const noindex = fetched.noindex || robotMetas.some(a=>/\b(noindex|none)\b/i.test(a.content || ""));
     if (noindex) throw new CrawlSkipped("Source requests no indexing; metadata was not saved.");
     const extracted = extractDocument(fetched.body,fetched.url,fetched.contentType,String(job.query));
+    if(isKnownRestrictedUrl(extracted.canonicalUrl,catalog))throw new CrawlSkipped("Canonical URL belongs to a paid or mixed-access source; metadata was not saved.");
     const source:CatalogSource = {id:String(item.source_id),name:"",url:String(item.url),domain:String(item.domain),category:String(item.category)};
     const existing = await first(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? AND url=?",user,id,extracted.canonicalUrl);
     const pageId = existing?.id || uid();
