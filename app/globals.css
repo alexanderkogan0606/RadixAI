@@ -12,3 +12,41 @@
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 
 .seed-count{font-size:10px;color:#858579;margin-top:8px;line-height:1.5}
+
+/* Teal is reserved for activity, focus and the primary action. Static chrome stays neutral. */
+:root{--accent:#9bddd0;--accent-bright:#c3f2e8;--accent-border:#42675f}
+.button.primary{background:#c1e4da;border-color:#caeee3;color:#15241f;box-shadow:0 1px 0 #ffffff28 inset,0 0 20px #8fd8c80c}
+.button.primary:hover:not(:disabled){background:#d6f1e8;border-color:#daf9ef;box-shadow:0 0 22px #8fd8c81b;color:#14221c}
+.status-dot.running{background:var(--accent);box-shadow:0 0 0 3px #9bddd016,0 0 10px #9bddd070}
+.run-actions .button.chosen{color:var(--accent-bright);border-color:#42675f;background:#9bddd00c}
+.spider-stage[data-live="true"]{box-shadow:0 1px 0 #9bddd026 inset}
+.spider-stage[data-live="true"] .canvas-metadata>span:first-child{color:var(--accent)}
+.spider-stage[data-live="true"] .canvas-metadata>span:first-child svg{filter:drop-shadow(0 0 4px #9bddd04a)}
+.graph-controls{background:#1b1d1c;border-color:#383e3b;box-shadow:0 3px 12px #0003,0 1px 0 #ffffff05 inset}
+.graph-controls button:hover{background:#25342f;color:var(--accent-bright)}
+.panel-tabs button.active:after{background:var(--accent);box-shadow:0 0 7px #9bddd032}
+.progress-track i{background:#96cbbb;box-shadow:0 0 7px #96cbbb22}
+.replay-bar input{accent-color:var(--accent)}
+.search:focus-within{border-color:var(--accent-border);box-shadow:0 0 0 2px #9bddd010}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,canvas:focus-visible{outline-color:var(--accent)}
+.crawl-shell{border-color:#343735;box-shadow:0 1px 0 #ffffff04 inset,0 12px 32px #00000012}
+.nav.active{background:#272b29;color:#e4eee9}
+
+.workflow-shortcuts{display:flex;gap:0;align-items:stretch;margin:-3px 0 17px;border-bottom:1px solid #272c29;padding-bottom:13px;max-width:720px}
+.workflow-shortcuts button{display:flex;align-items:center;gap:10px;flex:1;text-align:left;color:#c0ccc6;min-height:40px;padding:3px 15px;border-right:1px solid #2b302d}
+.workflow-shortcuts button:first-child{padding-left:0}.workflow-shortcuts button:last-child{border:0}.workflow-shortcuts button svg{color:#84ac9d}
+.workflow-shortcuts button span{font-size:12px}.workflow-shortcuts small{display:block;font-size:10px;color:#858c87;margin-top:4px}.workflow-shortcuts button:hover small{color:#b2beb7}
+.example-notice{display:flex;align-items:center;gap:10px;padding:11px 13px;margin:0 0 12px;border:1px solid #34453e;border-radius:6px;background:#1a231f;color:#acbfb4;font-size:11px;line-height:1.6}
+.example-notice b{font-weight:500;color:#d2e2d9}.example-notice>button{display:flex;align-items:center;gap:7px;margin-left:auto;white-space:nowrap;color:#c3e7d7;font-size:11px}
+.crawl-assistant-link{display:flex;align-items:center;gap:8px;font-size:11px;color:#abd4c2;margin:-5px 0 19px;padding:0;line-height:1.6;text-align:left}
+.crawl-advanced{border-top:1px solid #343a36;border-bottom:1px solid #343a36;margin:18px 0;padding:12px 0}
+.crawl-advanced summary{cursor:pointer;font-size:11px;color:#c2ccc6;list-style-position:inside}.crawl-advanced summary>span{display:block;margin:6px 0 0 13px;color:#818d85;font-size:10px}.crawl-advanced .form-label:last-child{margin-bottom:0}
+.crawl-selection-summary{background:#171d19;border:1px solid #334039;border-radius:6px;padding:12px 14px;margin-top:20px;font-size:11px;color:#bbc9c0;line-height:1.6}
+.crawl-selection-summary>b{font-weight:500;color:#dde5df;margin-right:14px}.crawl-selection-summary>p{font-size:10px;color:#94a79a;margin-top:6px;max-height:70px;overflow:auto}
+.crawl-form-error{margin:14px 0 0!important;color:#e0aaa0!important;font-size:12px!important;line-height:1.6}
+.workspace-inspector{position:fixed;right:18px;top:78px;bottom:18px;width:310px;max-width:calc(100vw - 28px);z-index:35}
+.workspace-inspector .source-inspector{inset:0;width:100%;max-width:none;box-shadow:0 12px 40px #0008,0 0 0 1px #0003}
+.focus-mode .workflow-shortcuts,.focus-mode .example-notice{display:none}
+@media(max-width:600px){.workflow-shortcuts{margin:0 0 13px;padding-bottom:10px}.workflow-shortcuts button{gap:6px;padding:0 9px;min-height:44px}.workflow-shortcuts button span{font-size:10px}.workflow-shortcuts small{display:none}.workflow-shortcuts button svg{width:12px}.example-notice{font-size:10px;flex-wrap:wrap}.example-notice>span{flex:1}.example-notice>button{font-size:10px;min-height:30px}.workspace-inspector{top:108px;right:12px;bottom:12px}.crawl-assistant-link{font-size:10px}.crawl-selection-summary>b{display:block;margin-bottom:3px}.crawl-advanced summary{min-height:30px}}
+
+.crawl-outcome{display:flex;align-items:center;gap:9px;padding:11px 18px;border-top:1px solid #2a332d;color:#94a89a;font-size:11px;line-height:1.7;background:#151a16}.crawl-outcome b{color:#bacfc0;font-weight:500}
