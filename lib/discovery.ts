@@ -1,12 +1,16 @@
 // @ts-expect-error Node's native TypeScript tests require the explicit extension.
-import { assessResource, cleanSearchQuery, queryTerms } from "./resource-quality.ts";
+import { assessResource, cleanSearchQuery, queryTerms, matchesAcquisitionContext } from "./resource-quality.ts";
 // @ts-expect-error Node's native TypeScript tests require the explicit extension.
 import { discoverFilings, isFilingQuery } from "./filing-discovery.ts";
 // @ts-expect-error Node's native TypeScript tests require the explicit extension.
 import { checkDocumentAvailability } from "./document-availability.ts";
+// @ts-expect-error Node's native TypeScript tests require the explicit extension.
+import { parseOpenAireDocuments, buildOpenAireUrl } from "./openaire-discovery.ts";
+// @ts-expect-error Node's native TypeScript tests require the explicit extension.
+import { documentIdentityKeys } from "./document-identity.ts";
 
 /** These are provider-attributed document records, not claims that the full text was read. */
-export type DiscoveryProvider="OpenAlex"|"World Bank"|"SEC EDGAR"|"Crossref";
+export type DiscoveryProvider="OpenAlex"|"World Bank"|"SEC EDGAR"|"Crossref"|"OpenAIRE";
 export interface DiscoveredDocument {
   id:string;title:string;name:string;url:string;description:string;provider:DiscoveryProvider;
   providerRecordUrl:string;publishedAt?:string;access:"Free";accessBasis:string;fullTextUrl?:string;
@@ -15,16 +19,18 @@ export interface DiscoveredDocument {
 }
 export interface ProviderStatus {
   provider:DiscoveryProvider;status:"ok"|"empty"|"error"|"rate-limited"|"timeout";
-  count:number;message?:string;httpStatus?:number;
+  count:number;message?:string;httpStatus?:number;retryAt?:string;skippedByCooldown?:boolean;
 }
-export interface DiscoveryResult {documents:DiscoveredDocument[];providers:ProviderStatus[];searchedAt:string}
-export interface DiscoveryOptions {fetcher?:typeof fetch;timeoutMs?:number}
+export interface DiscoverySearch {batch:number;nextBatch:number|null;candidatesChecked:number;queryVariants:string[];limitReached?:boolean}
+export interface DiscoveryResult {documents:DiscoveredDocument[];providers:ProviderStatus[];searchedAt:string;search?:DiscoverySearch}
+export interface DiscoveryOptions {fetcher?:typeof fetch;timeoutMs?:number;batch?:number;excludeUrls?:string[];excludeDois?:string[];continuationKey?:string}
 type RecordValue=Record<string,unknown>;
-type ProviderResult={documents:DiscoveredDocument[];status:ProviderStatus};
+type ProviderResult={documents:DiscoveredDocument[];status:ProviderStatus;candidatesChecked?:number;hasMore?:boolean};
 const MAX_RESPONSE_BYTES=1_000_000;
-const RESULTS_PER_PROVIDER=8;
-const REQUESTED_ROWS=12;
-const CROSSREF_ROWS=30;
+const RESULTS_PER_PROVIDER=24;
+const REQUESTED_ROWS=50;
+const CROSSREF_ROWS=75;
+const MAX_BATCHES=20;
 const defaultFetcher:typeof fetch=(input,init)=>globalThis.fetch(input,init);
 const record=(value:unknown):RecordValue=>value&&typeof value==="object"&&!Array.isArray(value)?value as RecordValue:{};
 const text=(value:unknown)=>typeof value==="string"?value.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<[^>]*>/g," ").replace(/&amp;|&#38;/gi,"&").replace(/&lt;/gi,"<").replace(/&gt;/gi,">").replace(/&quot;/gi,'"').replace(/&#39;|&apos;/gi,"'").replace(/&nbsp;/gi," ").replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<[^>]*>/g," ").replace(/[\u0000-\u001f\u007f]/g," ").replace(/\s+/g," ").trim():"";
@@ -40,8 +46,9 @@ function documentUrl(value:unknown,upgradeWorldBank=false):string|undefined {
     for(const key of [...url.searchParams.keys()])if(/^utm_/i.test(key)||["fbclid","gclid","msclkid"].includes(key.toLowerCase()))url.searchParams.delete(key);
     url.searchParams.sort();
     // A provider's home page or search listing is never a document result.
-    const path=url.pathname.replace(/\/+$/,"");
-    if(!path||/^(?:\/[a-z]{2})?\/(?:home|index\.(?:html?|php|aspx)|search|search-results|publications|papers|articles|reports|resources|library)$/i.test(path))return;
+    const path=decodeURIComponent(url.pathname).replace(/\/+$/,"");
+    if(/[<>]/.test(path)||/(?:^|\/)(?:browse|browse-by|authors?|creators|collections?|communities)(?:\/|$)/i.test(path)||/\/view\/(?:creators|years?|subjects|divisions|types)(?:\/|$)/i.test(path))return;
+    if(!path||/^(?:\/[a-z]{2})?\/(?:home|index\.(?:html?|php|aspx)|search|search-results|publications|papers|articles|reports|resources|library|research|blog|news)$/i.test(path))return;
     return url.href;
   }catch{return;}
 }
@@ -73,17 +80,25 @@ function worldBankAbstract(value:unknown):string {
 }
 
 /** Provider search can match incidental full-text mentions. Require evidence of the requested subject. */
-function subjectMatch(document:DiscoveredDocument,query:string):boolean {
+export function matchesDiscoverySubject(document:Pick<DiscoveredDocument,"title"|"description"|"url">,query:string):boolean {
+  if(!matchesAcquisitionContext(document,query))return false;
   const plurals:Record<string,string>={chains:"chain",semiconductors:"semiconductor",payments:"payment",markets:"market",industries:"industry",institutions:"institution",technologies:"technology"};
   const canonical=(term:string)=>plurals[term]||term;
   const wanted=queryTerms(query).map(canonical);if(!wanted.length)return false;
   const context=(value:string)=>{
     let result=value.replace(/\bsoftware[ -]as[ -]a[ -]service\b/gi,"SaaS").replace(/\bWorld Bank(?: Group)?\b/gi,match=>/\bWorld Bank\b/i.test(query)?match:"");
     if(wanted.includes("deployment"))result=result.replace(/\b(?:implementations?|adoptions?|applications?|applied|deployed)\b/gi,"deployment");
-    return result;
+    return result.replace(/\b(?:chains|semiconductors|payments|markets|industries|institutions|technologies)\b/gi,word=>canonical(word.toLowerCase()));
   };
   const title=context(document.title),lead=context(document.description.slice(0,450));
-  const titleTerms=new Set(queryTerms(title).map(canonical)),contentTerms=new Set(queryTerms(`${title} ${lead}`).map(canonical));
+  // queryTerms limits the user objective to 20 terms; metadata must not be truncated to 20 tokens.
+  const wantedQuery=wanted.join(" ");
+  const titleTerms=new Set(assessResource({url:document.url,title,description:""},wantedQuery).matchedTerms);
+  const contentTerms=new Set(assessResource({url:document.url,title,description:lead},wantedQuery).matchedTerms);
+  if(wanted.includes("merger")&&!/\b(?:galax\w*|astrophysic\w*|astronom\w*|black holes?|neutron|stellar|gravitational)\b/i.test(query)){
+    if(/\b(?:galax\w*|astrophysic\w*|black holes?|neutron|stellar|gravitational)\b/i.test(`${title} ${lead}`))return false;
+    if(!/\b(?:corporat\w*|compan\w*|firms?|banks?|business\w*|financ\w*|equity|shareholders?|acquisitions?|takeovers?|synerg\w*|valuation|profit\w*|revenue|industr\w*|enterprises?|transaction\w*|competition|antitrust)\b/i.test(`${title} ${lead}`))return false;
+  }
   const framing=new Set(["company","market","growth","risk","cost","price","impact","impacts","effect","effects","benefit","benefits","evidence","empirical","successful","role","outcome","outcomes"]);
   const subjects=wanted.filter(term=>!framing.has(term)&&!/^\d+$/.test(term));
   const anchors=subjects.length?subjects:wanted;
@@ -201,21 +216,43 @@ function crossrefDocuments(payload:unknown,query:string,foundAt:string):Discover
   }
   return documents;
 }
+type TopicProvider="OpenAlex"|"World Bank"|"Crossref"|"OpenAIRE";
+const TOPIC_PROVIDERS:TopicProvider[]=["OpenAlex","World Bank","Crossref","OpenAIRE"];
 class ProviderFailure extends Error {
-  providerStatus:ProviderStatus["status"];httpStatus?:number;
-  constructor(status:ProviderStatus["status"],message:string,httpStatus?:number){super(message);this.providerStatus=status;this.httpStatus=httpStatus;}
+  providerStatus:ProviderStatus["status"];httpStatus?:number;retryAt?:string;skippedByCooldown?:boolean;
+  constructor(status:ProviderStatus["status"],message:string,httpStatus?:number,retryAt?:string,skippedByCooldown?:boolean){super(message);this.providerStatus=status;this.httpStatus=httpStatus;this.retryAt=retryAt;this.skippedByCooldown=skippedByCooldown;}
 }
-async function boundedJson(url:string,fetcher:typeof fetch,timeoutMs:number):Promise<unknown> {
+const cooldowns=new WeakMap<typeof fetch,Map<TopicProvider,number>>();
+function assertProviderAvailable(provider:TopicProvider,fetcher:typeof fetch){
+  const until=cooldowns.get(fetcher)?.get(provider);
+  if(until&&until>Date.now())throw new ProviderFailure("rate-limited","The provider's free search limit is still active; its request was skipped while other free sources are searched.",429,new Date(until).toISOString(),true);
+  if(until)cooldowns.get(fetcher)?.delete(provider);
+}
+function recordRateLimit(provider:TopicProvider,fetcher:typeof fetch,header:string|null):string {
+  const now=Date.now(),seconds=header&&/^\d+(?:\.\d+)?$/.test(header.trim())?Number(header):undefined;
+  const parsed=header&&seconds===undefined?Date.parse(header):NaN;
+  const delay=seconds!==undefined?seconds*1000:Number.isFinite(parsed)?parsed-now:300000;
+  // Never retry immediately after 429; honor useful Retry-After values without an unbounded cache lifetime.
+  const until=now+Math.max(1000,Math.min(delay,86400000));
+  let state=cooldowns.get(fetcher);if(!state){state=new Map();cooldowns.set(fetcher,state);}state.set(provider,until);
+  return new Date(until).toISOString();
+}
+async function boundedJson(url:string,fetcher:typeof fetch,timeoutMs:number,provider:TopicProvider):Promise<unknown> {
+  assertProviderAvailable(provider,fetcher);
   const controller=new AbortController();let reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
   let timer:ReturnType<typeof setTimeout>|undefined;
   const deadline=new Promise<never>((_,reject)=>{timer=setTimeout(()=>{
     controller.abort();void reader?.cancel().catch(()=>{});
-    reject(new ProviderFailure("timeout","The provider did not respond before the search deadline. Try again later."));
+    reject(new ProviderFailure("timeout","The provider did not respond before the search deadline. Other free sources may still return results."));
   },timeoutMs);});
   try{
     return await Promise.race([deadline,(async()=>{
-      const response=await fetcher(url,{headers:{Accept:"application/json","User-Agent":"SignalResearch/1.0 (+https://signal-research-crawler.sk1616.chatgpt.site/)"},redirect:"manual",signal:controller.signal});
-      if(!response.ok){void response.body?.cancel();throw new ProviderFailure(response.status===429?"rate-limited":"error",response.status===429?"The provider's free search limit was reached. Try again later.":`The provider returned HTTP ${response.status}.`,response.status);}
+      const response=await fetcher(url,{headers:{Accept:"application/json","User-Agent":"RadixAI/1.0 (+https://radixai.sk1616.chatgpt.site/)"},redirect:"manual",signal:controller.signal});
+      if(!response.ok){
+        void response.body?.cancel();
+        if(response.status===429)throw new ProviderFailure("rate-limited","The provider's free search limit was reached. Other free sources are being searched.",429,recordRateLimit(provider,fetcher,response.headers.get("retry-after")));
+        throw new ProviderFailure("error",`The provider returned HTTP ${response.status}.`,response.status);
+      }
       if(Number(response.headers.get("content-length")||0)>MAX_RESPONSE_BYTES){void response.body?.cancel();throw new ProviderFailure("error","The provider response exceeded the search size limit.");}
       const contentType=response.headers.get("content-type")||"";
       if(contentType&&!/\bjson\b/i.test(contentType)){void response.body?.cancel();throw new ProviderFailure("error","The provider returned a non-JSON response.");}
@@ -225,46 +262,58 @@ async function boundedJson(url:string,fetcher:typeof fetch,timeoutMs:number):Pro
         if(bytes>MAX_RESPONSE_BYTES){void reader.cancel();throw new ProviderFailure("error","The provider response exceeded the search size limit.");}
         body+=decoder.decode(chunk.value,{stream:true});
       }
-      reader.releaseLock();reader=undefined;
-      body+=decoder.decode();
+      reader.releaseLock();reader=undefined;body+=decoder.decode();
       try{return JSON.parse(body);}catch{throw new ProviderFailure("error","The provider returned malformed JSON.");}
     })()]);
   }finally{if(timer)clearTimeout(timer);}
 }
-type TopicProvider="OpenAlex"|"World Bank"|"Crossref";
+const openAireCache=new WeakMap<typeof fetch,Map<string,{expires:number;value:Promise<unknown>}>>();
+async function openAireJson(url:string,fetcher:typeof fetch,budget:number):Promise<unknown> {
+  let cache=openAireCache.get(fetcher);if(!cache){cache=new Map();openAireCache.set(fetcher,cache);}
+  const entry=cache.get(url);let value=entry&&entry.expires>Date.now()?entry.value:undefined;
+  if(!value){
+    value=boundedJson(url,fetcher,budget,"OpenAIRE");
+    if(cache.size>=8)cache.delete(cache.keys().next().value!);cache.set(url,{expires:Date.now()+300000,value});
+    const activeCache=cache;void value.catch(()=>activeCache.delete(url));
+  }
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try{return await Promise.race([value,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ProviderFailure("timeout","OpenAIRE did not respond before the search deadline.")),budget);})]);}
+  finally{if(timer)clearTimeout(timer);}
+}
 type CrossrefState={nextStart:number;tail:Promise<void>;cache:Map<string,{expires:number;value:Promise<unknown>}>};
 const crossrefStates=new WeakMap<typeof fetch,CrossrefState>();
 async function crossrefJson(url:string,fetcher:typeof fetch,deadline:number):Promise<unknown> {
   let state=crossrefStates.get(fetcher);if(!state){state={nextStart:0,tail:Promise.resolve(),cache:new Map()};crossrefStates.set(fetcher,state);}
-  const remaining=deadline-Date.now();if(remaining<=0)throw new ProviderFailure("timeout","The search deadline was reached before the Crossref fallback could run.");
+  const remaining=deadline-Date.now();if(remaining<=0)throw new ProviderFailure("timeout","The search deadline was reached before Crossref could run.");
   const cached=state.cache.get(url);let value=cached&&cached.expires>Date.now()?cached.value:undefined;
   if(!value){
+    assertProviderAvailable("Crossref",fetcher);
     const previous=state.tail;
     value=(async()=>{
       await previous;
+      assertProviderAvailable("Crossref",fetcher);
       const start=Math.max(Date.now(),state.nextStart);
-      if(start>=deadline)throw new ProviderFailure("timeout","Crossref's public request queue is busy. Try again shortly.");
+      if(start>=deadline)throw new ProviderFailure("timeout","Crossref's public request queue is busy; other free sources may still return results.");
       state.nextStart=start+1050;
       if(start>Date.now())await new Promise(resolve=>setTimeout(resolve,start-Date.now()));
-      const available=deadline-Date.now();if(available<=0)throw new ProviderFailure("timeout","The search deadline was reached before the Crossref fallback could run.");
-      return boundedJson(url,fetcher,available);
+      const available=deadline-Date.now();if(available<=0)throw new ProviderFailure("timeout","The search deadline was reached before Crossref could run.");
+      return boundedJson(url,fetcher,available,"Crossref");
     })();
     state.tail=value.then(()=>{},()=>{});
-    if(state.cache.size>=60)state.cache.clear();state.cache.set(url,{expires:Date.now()+300000,value});
+    if(state.cache.size>=8)state.cache.delete(state.cache.keys().next().value!);state.cache.set(url,{expires:Date.now()+300000,value});
     const cache=state.cache;void value.catch(()=>{cache.delete(url);});
   }
-  // Each caller retains its own deadline even when sharing an in-flight query.
   let timer:ReturnType<typeof setTimeout>|undefined;
-  try{return await Promise.race([value,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ProviderFailure("timeout","Crossref did not respond before the search deadline. Try again later.")),remaining);})]);}
+  try{return await Promise.race([value,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ProviderFailure("timeout","Crossref did not respond before the search deadline.")),remaining);})]);}
   finally{if(timer)clearTimeout(timer);}
 }
-async function confirmCrossrefDocuments(candidates:DiscoveredDocument[],fetcher:typeof fetch,deadline:number):Promise<DiscoveredDocument[]> {
+async function confirmCrossrefDocuments(candidates:DiscoveredDocument[],fetcher:typeof fetch,deadline:number,onAttempt:(document:DiscoveredDocument)=>void):Promise<DiscoveredDocument[]> {
   const confirmed:(DiscoveredDocument|undefined)[]=new Array(candidates.length);let next=0;
   await Promise.all(Array.from({length:Math.min(3,candidates.length)},async()=>{
     while(next<candidates.length){
       const index=next++,candidate=candidates[index],remaining=deadline-Date.now();if(remaining<=25)break;
-      // Verify only the copy selected under this license. A failed accepted manuscript
-      // must never be replaced by the DOI's differently licensed version of record.
+      // Verify only the copy selected under this license. Never replace a failed accepted manuscript with an unlicensed DOI copy.
+      onAttempt(candidate);
       const available=await checkDocumentAvailability(candidate.url,{fetcher,timeoutMs:Math.min(3000,remaining)});
       if(available)confirmed[index]={...candidate,url:available.url,fullTextUrl:available.url,
         accessBasis:`${candidate.accessBasis.replace("destination availability has not been independently checked.","the provider's license applies to the identified work.")} A public ${available.kind.toUpperCase()} response was fetched successfully without credentials at ${new Date().toISOString()}; a bounded content prefix was checked for document content and access gates. The full document has not been read or analyzed.`};
@@ -272,57 +321,124 @@ async function confirmCrossrefDocuments(candidates:DiscoveredDocument[],fetcher:
   }));
   return confirmed.filter((document):document is DiscoveredDocument=>!!document);
 }
-function providerUrl(provider:TopicProvider,query:string):string {
+function queryPlan(query:string):string[] {
+  // Drop request framing from search syntax, never from the relevance objective.
+  const core=query.replace(/\b(?:case studies|case study|research|articles?|papers?|reports?|documents?|resources?|examples?|please|find|show|me|how|is|are|being|used|using|regarding|concerning|about|the|and|in|on|of|for)\b/gi," ").replace(/\s+/g," ").trim()||query;
+  const terms=queryTerms(query),variants=[core,query];
+  if(terms.includes("merger"))variants.push("corporate acquisitions","post merger integration");
+  else if(terms.includes("saas"))variants.push(`${core} subscription software`,`${core} enterprise software`);
+  else if(terms.includes("ai")&&terms.includes("bank"))variants.push(`${core} financial services`,`${core} commercial banks`);
+  else variants.push(`${core} empirical evidence`,`${core} case study`);
+  return [...new Set(variants.map(value=>value.trim().slice(0,300)).filter(Boolean))].slice(0,4);
+}
+function providerUrl(provider:TopicProvider,query:string,page:number):string {
+  const expanded=query.replace(/\bai\b/gi,"artificial intelligence");
+  if(provider==="OpenAIRE")return buildOpenAireUrl(expanded,page,REQUESTED_ROWS);
   const url=new URL(provider==="OpenAlex"?"https://api.openalex.org/works":provider==="Crossref"?"https://api.crossref.org/works":"https://search.worldbank.org/api/v3/wds");
   if(provider==="OpenAlex"){
-    url.searchParams.set("search",query.replace(/\bai\b/gi,"artificial intelligence"));url.searchParams.set("filter","open_access.is_oa:true");url.searchParams.set("per-page",String(REQUESTED_ROWS));
+    url.searchParams.set("search",expanded);url.searchParams.set("filter","open_access.is_oa:true");url.searchParams.set("per-page",String(REQUESTED_ROWS));url.searchParams.set("page",String(page+1));
     url.searchParams.set("select","id,title,doi,publication_date,open_access,best_oa_location,locations,abstract_inverted_index,type,is_retracted");
   }else if(provider==="Crossref"){
-    url.searchParams.set("query",query.replace(/\bai\b/gi,"artificial intelligence"));url.searchParams.set("rows",String(CROSSREF_ROWS));
+    url.searchParams.set("query",expanded);url.searchParams.set("rows",String(CROSSREF_ROWS));url.searchParams.set("offset",String(page*CROSSREF_ROWS));
     url.searchParams.set("filter","has-abstract:true,has-license:true");url.searchParams.set("select","DOI,title,abstract,published,URL,link,license,type");
   }else{
-    url.searchParams.set("format","json");url.searchParams.set("qterm",query.replace(/\bai\b/gi,"artificial intelligence"));url.searchParams.set("rows",String(REQUESTED_ROWS));
+    url.searchParams.set("format","json");url.searchParams.set("qterm",expanded);url.searchParams.set("rows",String(REQUESTED_ROWS));url.searchParams.set("os",String(page*REQUESTED_ROWS));
     url.searchParams.set("fl","docdt,abstracts,docty,pdfurl,url,display_title");
   }
   return url.href;
 }
+function pageSize(provider:TopicProvider,payload:unknown,page:number):{count:number;hasMore:boolean} {
+  const body=record(payload),message=record(body.message);
+  const rows=provider==="Crossref"?CROSSREF_ROWS:REQUESTED_ROWS;
+  const raw=provider==="OpenAlex"?body.results:provider==="Crossref"?message.items:provider==="OpenAIRE"?body.results:undefined;
+  const count=provider==="World Bank"?Object.keys(record(body.documents)).filter(key=>key!=="facets").length:Array.isArray(raw)?raw.length:0;
+  const rawTotal=provider==="OpenAlex"?record(body.meta).count:provider==="Crossref"?message["total-results"]:provider==="OpenAIRE"?record(body.header).numFound:body.total;
+  const total=(typeof rawTotal==="number"||typeof rawTotal==="string"&&/^\d+$/.test(rawTotal))?Number(rawTotal):NaN;
+  return {count,hasMore:Number.isFinite(total)&&total>=0?(page+1)*rows<total:count>=rows};
+}
+const documentKeys=documentIdentityKeys;
+function exclusionKeys(options:DiscoveryOptions):Set<string>{
+  const excluded=new Set<string>();
+  for(const value of (options.excludeUrls||[]).slice(0,10000)){const url=documentUrl(value);if(url)documentIdentityKeys({url}).forEach(key=>excluded.add(key));}
+  for(const value of (options.excludeDois||[]).slice(0,5000)){const doi=normalizedDoi(value);if(doi)excluded.add(`doi:${doi}`);}
+  return excluded;
+}
+type ProgressState={expires:number;query:string;exhausted:Set<string>;pending:Map<TopicProvider,DiscoveredDocument[]>;attempted:Map<TopicProvider,Set<string>>;truncated:boolean};
+const progressStates=new WeakMap<typeof fetch,Map<string,ProgressState>>();
+function progressFor(fetcher:typeof fetch,query:string,continuationKey?:string):ProgressState {
+  const fresh=():ProgressState=>({expires:Date.now()+300000,query,exhausted:new Set(),pending:new Map(),attempted:new Map(),truncated:false});
+  // Continuations use a server-generated search UUID, never a shared user query or client-supplied identity.
+  if(!continuationKey||!/^[a-zA-Z0-9_-]{8,100}$/.test(continuationKey))return fresh();
+  let searches=progressStates.get(fetcher);if(!searches){searches=new Map();progressStates.set(fetcher,searches);}
+  let progress=searches.get(continuationKey);
+  if(!progress||progress.query!==query||progress.expires<=Date.now()){
+    for(const [key,value] of searches)if(value.expires<=Date.now())searches.delete(key);
+    if(searches.size>=10)searches.delete(searches.keys().next().value!);
+    progress=fresh();searches.set(continuationKey,progress);
+  }else progress.expires=Date.now()+300000;
+  return progress;
+}
 
-/** Company filing requests use SEC; topic research uses two independent no-key providers. */
+/** Company filing requests use SEC; topic research queries independent free public indexes. */
 export async function discoverDocuments(input:string,options:DiscoveryOptions={}):Promise<DiscoveryResult> {
-  const query=cleanSearchQuery(input),searchedAt=new Date().toISOString(),providers:("OpenAlex"|"World Bank")[]=["OpenAlex","World Bank"];
+  const query=cleanSearchQuery(input),searchedAt=new Date().toISOString();
+  const batch=Number.isInteger(options.batch)?Math.max(0,Math.min(MAX_BATCHES-1,options.batch!)):0;
   if(isFilingQuery(query)){
-    const filings=await discoverFilings(query,options,searchedAt);
-    return {documents:filings.documents,providers:[filings.status],searchedAt};
+    const filings=await discoverFilings(query,options,searchedAt),excluded=exclusionKeys(options);
+    return {documents:filings.documents.filter(document=>!documentKeys(document).some(key=>excluded.has(key))),providers:[filings.status],searchedAt,search:{batch,nextBatch:null,candidatesChecked:filings.documents.length,queryVariants:[query]}};
   }
-  if(query.length<2||!queryTerms(query).length)return {documents:[],searchedAt,providers:providers.map(provider=>({provider,status:"empty",count:0,message:"Enter a specific research topic to search for documents."}))};
-  const fetcher=options.fetcher||defaultFetcher,timeoutMs=Math.max(50,Math.min(options.timeoutMs||8000,8000)),deadline=Date.now()+timeoutMs;
-  const runProvider=async(provider:TopicProvider,budget=deadline-Date.now()):Promise<ProviderResult>=>{
+  if(query.length<2||!queryTerms(query).length)return {documents:[],searchedAt,providers:TOPIC_PROVIDERS.map(provider=>({provider,status:"empty",count:0,message:"Enter a specific research topic to search for documents."})),search:{batch,nextBatch:null,candidatesChecked:0,queryVariants:[]}};
+  const fetcher=options.fetcher||defaultFetcher,timeoutMs=Math.max(50,Math.min(options.timeoutMs||15000,15000)),deadline=Date.now()+timeoutMs;
+  const variants=queryPlan(query),page=Math.floor(batch/variants.length),excluded=exclusionKeys(options),progress=progressFor(fetcher,query,options.continuationKey);
+  const searches=TOPIC_PROVIDERS.map(provider=>{
+    // Crossref's title/abstract search benefits from the original case-study phrase; World Bank starts with broad topic terms.
+    const first=provider==="Crossref"?Math.max(0,variants.indexOf(query)):0;
+    const variant=(batch+first)%variants.length;
+    return {provider,variant,query:variants[variant]};
+  });
+  const runProvider=async({provider,variant,query:searchQuery}:typeof searches[number]):Promise<ProviderResult>=>{
+    const progressKey=`${provider}:${variant}`;
     try{
-      if(budget<=0)throw new ProviderFailure("timeout","The search deadline was reached before this provider could run.");
-      const payload=provider==="Crossref"?await crossrefJson(providerUrl(provider,query),fetcher,Math.min(deadline,Date.now()+2500)):await boundedJson(providerUrl(provider,query),fetcher,budget);
-      const candidates=(provider==="OpenAlex"?openAlexDocuments:provider==="Crossref"?crossrefDocuments:worldBankDocuments)(payload,query,searchedAt);
-      const matched=candidates.map(document=>({document,assessment:assessResource(document,query)})).filter(item=>item.assessment.eligible&&subjectMatch(item.document,query)).sort((a,b)=>b.assessment.score-a.assessment.score).slice(0,RESULTS_PER_PROVIDER).map(item=>item.document);
-      const documents=provider==="Crossref"?await confirmCrossrefDocuments(matched,fetcher,deadline):matched;
-      if(provider==="Crossref"&&!documents.length&&matched.length)return {documents:[],status:{provider,status:Date.now()>=deadline?"timeout":"empty",count:0,message:"Matching records found, but no document passed the public-access check."}};
-      return {documents,status:{provider,status:documents.length?"ok":"empty",count:documents.length,...(!documents.length?{message:"No matching free documents with usable titles or summaries were returned."}:{})}};
+      const budget=deadline-Date.now();if(budget<=0)throw new ProviderFailure("timeout","The search deadline was reached before this provider could run.");
+      const url=providerUrl(provider,searchQuery,page);
+      const payload=provider==="Crossref"?await crossrefJson(url,fetcher,Math.min(deadline,Date.now()+6000)):provider==="OpenAIRE"?await openAireJson(url,fetcher,budget):await boundedJson(url,fetcher,Math.min(budget,provider==="OpenAlex"?8000:15000),provider);
+      const pagination=pageSize(provider,payload,page);
+      const candidates=(provider==="OpenAlex"?openAlexDocuments:provider==="Crossref"?crossrefDocuments:provider==="OpenAIRE"?parseOpenAireDocuments:worldBankDocuments)(payload,query,searchedAt);
+      const attempted=progress.attempted.get(provider)||new Set<string>();progress.attempted.set(provider,attempted);
+      const seen=new Set([...excluded,...attempted]);
+      const qualified=candidates.map(document=>({document,assessment:assessResource(document,query)})).filter(item=>item.assessment.eligible&&matchesDiscoverySubject(item.document,query)).sort((a,b)=>{
+        const direct=(document:DiscoveredDocument)=>Number(!/\bdoi\.org\//i.test(document.url));
+        return provider==="Crossref"?(direct(b.document)-direct(a.document)||b.assessment.score-a.assessment.score):b.assessment.score-a.assessment.score;
+      }).map(item=>item.document);
+      // Carry the unreturned eligible records into this search's next batch before adding new records.
+      const matched=[...(progress.pending.get(provider)||[]),...qualified].filter(document=>{const keys=documentKeys(document);if(keys.some(key=>seen.has(key)))return false;keys.forEach(key=>seen.add(key));return true;});
+      const selected=matched.slice(0,RESULTS_PER_PROVIDER),pending=matched.slice(RESULTS_PER_PROVIDER),checked:DiscoveredDocument[]=[];
+      const documents=provider==="Crossref"?await confirmCrossrefDocuments(selected,fetcher,deadline,document=>checked.push(document)):selected;
+      const confirmed=new Set(documents.flatMap(documentKeys));
+      // Successful documents stay retryable until the server sends their persisted URL/DOI exclusions.
+      // Only unsuccessful public-access checks are suppressed within this search chain.
+      for(const document of checked)if(!documentKeys(document).some(key=>confirmed.has(key)))documentKeys(document).forEach(key=>attempted.add(key));
+      const deferred=[...selected,...pending].filter(document=>!documentKeys(document).some(key=>attempted.has(key)));
+      if(deferred.length>100)progress.truncated=true;progress.pending.set(provider,deferred.slice(0,100));
+      const hasMore=pagination.hasMore||pending.length>0;
+      // Provider pagination is independent of a user's exclusion list. Pending records prevent final exhaustion.
+      if(!pagination.hasMore)progress.exhausted.add(progressKey);else progress.exhausted.delete(progressKey);
+      if(provider==="Crossref"&&!documents.length&&matched.length)return {documents:[],candidatesChecked:pagination.count,hasMore,status:{provider,status:Date.now()>=deadline?"timeout":"empty",count:0,message:"Matching records found, but no document passed the public-access check."}};
+      return {documents,candidatesChecked:pagination.count,hasMore,status:{provider,status:documents.length?"ok":"empty",count:documents.length,...(!documents.length?{message:matched.length?"No new documents were available in this batch.":"No new matching free documents with usable titles or summaries were returned in this batch."}:{})}};
     }catch(error){
-      // Keep provider/network diagnostics on the server; never log the query, URL, body or credentials.
       if(!(error instanceof ProviderFailure))console.warn("Document discovery request failed",{provider,name:error instanceof Error?error.name:"UnknownError",message:error instanceof Error?error.message.replace(/https?:\/\/[^\s"']+/gi,"[provider URL]").slice(0,300):"Unknown network failure"});
-      const failure=error instanceof ProviderFailure?error:error instanceof Error&&["AbortError","TimeoutError"].includes(error.name)?new ProviderFailure("timeout","The provider did not respond before the search deadline. Try again later."):new ProviderFailure("error","The provider could not be reached. Other providers may still return results.");
-      return {documents:[],status:{provider,status:failure.providerStatus,count:0,message:failure.message,...(failure.httpStatus?{httpStatus:failure.httpStatus}:{})}};
+      const failure=error instanceof ProviderFailure?error:error instanceof Error&&["AbortError","TimeoutError"].includes(error.name)?new ProviderFailure("timeout","The provider did not respond before the search deadline."):new ProviderFailure("error","The provider could not be reached. Other providers may still return results.");
+      progress.exhausted.delete(progressKey);
+      return {documents:[],candidatesChecked:0,hasMore:true,status:{provider,status:failure.providerStatus,count:0,message:failure.message,...(failure.httpStatus?{httpStatus:failure.httpStatus}:{}),...(failure.retryAt?{retryAt:failure.retryAt}:{}),...(failure.skippedByCooldown?{skippedByCooldown:true}:{})}};
     }
   };
-  const [academic,worldBank]=await Promise.all([(async()=>{
-    const primary=await runProvider("OpenAlex",Math.min(3000,timeoutMs*.375));
-    if(["error","rate-limited","timeout"].includes(primary.status.status))return [primary,await runProvider("Crossref")];
-    return [primary];
-  })(),runProvider("World Bank")]);
-  const results=[academic[0],worldBank,...academic.slice(1)];
-  const seen=new Set<string>(),documents:DiscoveredDocument[]=[];
+  const results=await Promise.all(searches.map(runProvider));
+  const seen=new Set(excluded),documents:DiscoveredDocument[]=[];
   for(const document of results.flatMap(result=>result.documents)){
-    const keys=[`url:${document.url}`,...(document.fullTextUrl?[`url:${document.fullTextUrl}`]:[]),...(document.doi?[`doi:${document.doi}`]:[])];
-    const duplicate=keys.some(key=>seen.has(key));keys.forEach(key=>seen.add(key));
-    if(!duplicate)documents.push(document);
+    const keys=documentKeys(document),duplicate=keys.some(key=>seen.has(key));keys.forEach(key=>seen.add(key));if(!duplicate)documents.push(document);
   }
-  return {documents,providers:results.map(result=>result.status),searchedAt};
+  const delivered=new Set(documents.flatMap(documentKeys));
+  const exhausted=!progress.truncated&&TOPIC_PROVIDERS.every(provider=>!(progress.pending.get(provider)||[]).some(document=>!documentKeys(document).some(key=>delivered.has(key)||excluded.has(key)))&&variants.every((_,index)=>progress.exhausted.has(`${provider}:${index}`)));
+  const limitReached=batch===MAX_BATCHES-1&&!exhausted;
+  return {documents,providers:results.map(result=>result.status),searchedAt,search:{batch,nextBatch:exhausted||batch===MAX_BATCHES-1?null:batch+1,candidatesChecked:results.reduce((sum,result)=>sum+(result.candidatesChecked||0),0),queryVariants:[...new Set(searches.map(search=>search.query))],...(limitReached?{limitReached:true}:{})}};
 }

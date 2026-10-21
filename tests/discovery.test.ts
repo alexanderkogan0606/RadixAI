@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 // @ts-expect-error Node's native TypeScript runner requires the explicit extension.
-import {discoverDocuments} from "../lib/discovery.ts";
+import {discoverDocuments,matchesDiscoverySubject} from "../lib/discovery.ts";
+// @ts-expect-error Node's native TypeScript runner requires the explicit extension.
+import {documentIdentityKeys} from "../lib/document-identity.ts";
 
 const topic="banking artificial intelligence";
 function inverted(abstract:string){
@@ -21,15 +23,15 @@ function bankDocument(overrides:Record<string,unknown>={}){
 function json(value:unknown){return new Response(JSON.stringify(value),{headers:{"content-type":"application/json"}});}
 function fixtureFetch(openAlex:unknown,worldBank:unknown,requests:{url:URL;init?:RequestInit}[]=[]):typeof fetch {
   return (async(input:RequestInfo|URL,init?:RequestInit)=>{const url=new URL(String(input));requests.push({url,init});
-    return json(url.hostname==="api.openalex.org"?openAlex:worldBank);
+    return json(url.hostname==="api.openalex.org"?openAlex:url.hostname==="search.worldbank.org"?worldBank:url.hostname==="api.crossref.org"?{status:"ok",message:{items:[]}}:{header:{numFound:0},results:[]});
   }) as typeof fetch;
 }
 
 test("Discovery returns real item links, decoded abstracts, provider evidence and publication dates",async()=>{
   const requests:{url:URL;init?:RequestInit}[]=[];
   const result=await discoverDocuments(`show me research on ${topic}`,{fetcher:fixtureFetch({results:[work()]},{documents:{D33142246:bankDocument(),facets:{}}},requests)});
-  assert.equal(requests.length,2);assert.equal(result.documents.length,2);
-  assert.deepEqual(result.providers.map(p=>[p.provider,p.status,p.count]),[["OpenAlex","ok",1],["World Bank","ok",1]]);
+  assert.equal(requests.length,4);assert.equal(result.documents.length,2);
+  assert.deepEqual(result.providers.map(p=>[p.provider,p.status,p.count]),[["OpenAlex","ok",1],["World Bank","ok",1],["Crossref","empty",0],["OpenAIRE","empty",0]]);
   assert.ok(requests.every(request=>request.url.protocol==="https:"&&request.init?.redirect==="manual"&&request.init.signal));
   assert.ok(requests.every(request=>!request.url.searchParams.has("api_key")),"Discovery requires no credentials.");
   assert.equal(requests[0].url.searchParams.get("search"),topic);
@@ -71,7 +73,7 @@ test("AI queries expand the acronym and reject access-to-information and publish
     D3:bankDocument({id:"3",display_title:"Artificial intelligence in commercial banking",abstracts:{"cdata!":"This report evaluates artificial intelligence for commercial banking, credit decisions and fraud prevention using measured lending outcomes."}}),
   };
   const result=await discoverDocuments("AI in banking",{fetcher:fixtureFetch({results:[]},{documents},requests)});
-  assert.ok(requests.every(request=>(request.url.searchParams.get("search")||request.url.searchParams.get("qterm"))==="artificial intelligence in banking"));
+  assert.ok(requests.every(request=>(request.url.searchParams.get("search")||request.url.searchParams.get("qterm")||request.url.searchParams.get("query")||"").includes("artificial intelligence")));
   assert.deepEqual(result.documents.map(document=>document.id),["worldbank-3"]);
   assert.equal(result.documents[0].query,"AI in banking","The user's query is preserved separately from API expansion.");
 });
@@ -82,6 +84,28 @@ test("M&A must be a primary title subject rather than a law-firm service mention
     D2:bankDocument({id:"2",display_title:"Mergers and acquisitions in emerging markets",abstracts:{"cdata!":"This case study evaluates mergers and acquisitions through measured integration costs and operational performance after the transaction."}}),
   }})});
   assert.deepEqual(result.documents.map(document=>document.id),["worldbank-2"]);
+});
+
+test("Corporate M&A excludes land-acquisition and resettlement reports but keeps shareholder expropriation research",async()=>{
+  const result=await discoverDocuments("M&A case studies",{fetcher:fixtureFetch({results:[]},{documents:{
+    D1:bankDocument({id:"1",url:"https://documents.worldbank.org/curated/en/10001",display_title:"Land acquisition and involuntary resettlement: performance standard 5",abstracts:{"cdata!":"This report explains compensation for land acquisition and involuntary resettlement in infrastructure projects and financial safeguards."}}),
+    D2:bankDocument({id:"2",url:"https://documents.worldbank.org/curated/en/10002",display_title:"Rampur hydro power project: land acquisition and community development practices",abstracts:{"cdata!":"The report examines land acquisition, compensation and community development practices in a major power investment project."}}),
+    D3:bankDocument({id:"3",url:"https://documents.worldbank.org/curated/en/10003",display_title:"Controlling shareholder stock pledge, aggravated expropriation and corporate acquisitions",abstracts:{"cdata!":"This study measures shareholder expropriation during corporate acquisitions and the effects on minority shareholder returns."}}),
+    D4:bankDocument({id:"4",url:"https://documents.worldbank.org/curated/en/10004",pdfurl:"https://documents.worldbank.org/curated/en/10004/pdf/compensation.pdf",display_title:"Compensation for executives after mergers and acquisitions",abstracts:{"cdata!":"This paper measures executive compensation and financial performance following mergers and acquisitions of public companies."}}),
+  }})});
+  assert.deepEqual(result.documents.map(document=>document.id),["worldbank-3","worldbank-4"]);
+  assert.equal(matchesDiscoverySubject({url:"https://publicresearch.org/report/land",title:"Land acquisition and involuntary resettlement",description:"This report studies compensation practices in land acquisition and involuntary resettlement."},"land acquisition resettlement"),true);
+});
+
+test("Document identity merges exact Zenodo route aliases and destination DOIs without merging versions by title",()=>{
+  const old={url:"https://zenodo.org/record/7050039",doi:"10.5281/zenodo.7050038"},current={url:"https://zenodo.org/records/7050039",doi:"10.5281/zenodo.7050039"};
+  assert.ok(documentIdentityKeys(old).some(key=>documentIdentityKeys(current).includes(key)));
+  const selected={url:"https://doi.org/10.1016/j.jcorpfin.2017.11.003",doi:"10.2139/ssrn.2747036"};
+  assert.ok(documentIdentityKeys(selected).includes("doi:10.1016/j.jcorpfin.2017.11.003"));
+  assert.ok(!documentIdentityKeys(selected).includes("doi:10.2139/ssrn.2747036"));
+  assert.ok(!documentIdentityKeys({url:"https://zenodo.org/records/7050038"}).some(key=>documentIdentityKeys(current).includes(key)));
+  assert.ok(!documentIdentityKeys({url:"https://doi.org/10.2139/ssrn.2747036"}).some(key=>documentIdentityKeys(selected).includes(key)));
+  assert.ok(!documentIdentityKeys({url:"https://zenodo.org/record/7050039/files/article.pdf"}).some(key=>documentIdentityKeys(current).includes(key)));
 });
 
 test("Default topic prompts handle singular supply chains and explicit AI deployment vocabulary",async()=>{
@@ -152,7 +176,7 @@ test("Provider bodies and result counts are bounded",async()=>{
   }
   const rows=Array.from({length:100},(_,i)=>work({id:`https://openalex.org/W${1000+i}`,doi:`10.1234/bank${i}`,open_access:{is_oa:true,oa_url:`https://repository.edu/record/${i}`},best_oa_location:{is_oa:true,landing_page_url:`https://repository.edu/record/${i}`,pdf_url:null}}));
   const result=await discoverDocuments(topic,{fetcher:fixtureFetch({results:rows},{documents:{}})});
-  assert.equal(result.documents.length,8);
+  assert.equal(result.documents.length,24);
 });
 
 test("Blank and operational queries make no network requests",async()=>{
@@ -173,6 +197,7 @@ function crossrefFixture(items:unknown[],requests:string[]=[],documentResponse:(
     if(url.hostname==="api.openalex.org")return new Response(null,{status:429});
     if(url.hostname==="search.worldbank.org")return json({documents:{}});
     if(url.hostname==="api.crossref.org")return json({status:"ok",message:{items}});
+    if(url.hostname==="api.openaire.eu")return json({header:{numFound:0},results:[]});
     return documentResponse();
   };
 }
@@ -180,7 +205,7 @@ function crossrefFixture(items:unknown[],requests:string[]=[],documentResponse:(
 test("OpenAlex failures fall back to licensed and publicly reachable Crossref articles while retaining provider failures",async()=>{
   const requests:string[]=[];
   const result=await discoverDocuments("AI in banking",{fetcher:crossrefFixture([crossrefWork()],requests)});
-  assert.deepEqual(result.providers.map(provider=>[provider.provider,provider.status]),[["OpenAlex","rate-limited"],["World Bank","empty"],["Crossref","ok"]]);
+  assert.deepEqual(result.providers.map(provider=>[provider.provider,provider.status]),[["OpenAlex","rate-limited"],["World Bank","empty"],["Crossref","ok"],["OpenAIRE","empty"]]);
   assert.equal(result.documents.length,1);const document=result.documents[0];
   assert.equal(document.provider,"Crossref");assert.equal(document.access,"Free");assert.equal(document.publishedAt,"2025-04-09");
   assert.equal(document.url,"https://repository.edu/papers/banking-ai.pdf");assert.equal(document.fullTextUrl,document.url);
@@ -192,11 +217,11 @@ test("OpenAlex failures fall back to licensed and publicly reachable Crossref ar
   assert.equal(requests.filter(url=>url.includes("repository.edu")).length,1);
 });
 
-test("Successful and empty OpenAlex searches never trigger the Crossref fallback",async()=>{
+test("All four independent providers are searched even when OpenAlex succeeds or is empty",async()=>{
   for(const works of [[],[work()]]){
     const requests:{url:URL;init?:RequestInit}[]=[];
     const result=await discoverDocuments(topic,{fetcher:fixtureFetch({results:works},{documents:{}},requests)});
-    assert.equal(result.providers.length,2);assert.equal(requests.length,2);assert.ok(!requests.some(request=>request.url.hostname==="api.crossref.org"));
+    assert.equal(result.providers.length,4);assert.equal(requests.length,4);assert.ok(requests.some(request=>request.url.hostname==="api.crossref.org"));
   }
 });
 
@@ -217,7 +242,7 @@ test("Crossref licenses exclude TDM contracts, embargoes, spoofed hosts, conflic
   const requests:string[]=[];
   const result=await discoverDocuments(topic,{fetcher:crossrefFixture(badLicenses.map((license,index)=>crossrefWork({DOI:`10.1234/bad.${index}`,license:[license]})),requests)});
   assert.deepEqual(result.documents,[]);assert.equal(result.providers.find(provider=>provider.provider==="Crossref")?.status,"empty");
-  assert.ok(requests.every(url=>/api\.openalex|search\.worldbank|api\.crossref/.test(url)),"Unlicensed or embargoed content must not be probed or claimed free.");
+  assert.ok(requests.every(url=>/api\.openalex|search\.worldbank|api\.crossref|api\.openaire/.test(url)),"Unlicensed or embargoed content must not be probed or claimed free.");
 });
 
 test("Crossref accepted-manuscript licenses apply only to their matching copy and never retry an unlicensed DOI",async()=>{
@@ -288,4 +313,127 @@ test("The fallback and public-access checks share the original bounded search de
   };
   const result=await discoverDocuments(topic,{fetcher,timeoutMs:80});assert.equal(result.documents.length,0);assert.ok(performance.now()-started<250);
   assert.equal(result.providers[0].status,"timeout");assert.ok(result.providers.some(provider=>provider.provider==="Crossref"));
+});
+
+test("429 Retry-After suppresses only the blocked provider and resumes it after cooldown",async t=>{
+  let now=Date.now(),openAlexCalls=0,bankCalls=0;t.mock.method(Date,"now",()=>now);
+  const fetcher:typeof fetch=async input=>{
+    const host=new URL(String(input)).hostname;
+    if(host==="api.openalex.org"){openAlexCalls++;return openAlexCalls===1?new Response(null,{status:429,headers:{"retry-after":"120"}}):json({results:[work()]});}
+    if(host==="search.worldbank.org"){bankCalls++;return json({documents:{D1:bankDocument()}});}
+    return json(host==="api.crossref.org"?{status:"ok",message:{items:[]}}:{header:{numFound:0},results:[]});
+  };
+  const first=await discoverDocuments(topic,{fetcher});
+  assert.equal(first.providers[0].retryAt,new Date(now+120000).toISOString());assert.equal(first.providers[0].skippedByCooldown,undefined);
+  const second=await discoverDocuments(topic,{fetcher});
+  assert.equal(openAlexCalls,1);assert.equal(bankCalls,2);assert.equal(second.providers[0].skippedByCooldown,true);assert.equal(second.documents.length,1);
+  assert.equal(second.search?.nextBatch,1,"A blocked provider is retryable, not exhausted.");
+  now+=120001;
+  const third=await discoverDocuments(topic,{fetcher});assert.equal(openAlexCalls,2);assert.equal(third.providers[0].status,"ok");
+});
+
+test("HTTP-date Retry-After and a missing header produce bounded truthful retry times",async()=>{
+  for(const header of [new Date(Date.now()+90000).toUTCString(),null]){
+    const started=Date.now();
+    const fetcher:typeof fetch=async input=>new URL(String(input)).hostname==="api.openalex.org"?new Response(null,{status:429,headers:header?{"retry-after":header}:{}}):json(new URL(String(input)).hostname==="api.crossref.org"?{status:"ok",message:{items:[]}}:new URL(String(input)).hostname==="search.worldbank.org"?{documents:{}}:{header:{numFound:0},results:[]});
+    const result=await discoverDocuments(topic,{fetcher}),retry=Date.parse(result.providers[0].retryAt!);
+    assert.ok(retry>=started+(header?88000:299000));assert.ok(retry<=Date.now()+(header?90000:300000));
+    assert.equal(result.providers[0].status,"rate-limited");
+  }
+});
+
+test("Queued Crossref requests observe the first rate limit without another network attempt",async()=>{
+  let calls=0;
+  const fetcher:typeof fetch=async input=>{
+    const host=new URL(String(input)).hostname;
+    if(host==="api.crossref.org"){calls++;return new Response(null,{status:429,headers:{"retry-after":"60"}});}
+    return json(host==="search.worldbank.org"?{documents:{}}:{header:{numFound:0},results:[]});
+  };
+  const start=performance.now(),results=await Promise.all([discoverDocuments(topic,{fetcher}),discoverDocuments(`${topic} outcomes`,{fetcher})]);
+  assert.equal(calls,1);assert.ok(performance.now()-start<700);
+  assert.ok(results.every(result=>result.providers.find(provider=>provider.provider==="Crossref")?.status==="rate-limited"));
+  assert.ok(results.some(result=>result.providers.find(provider=>provider.provider==="Crossref")?.skippedByCooldown));
+});
+
+test("Search rotates core and subject variants, paginates, and reports raw examined records",async t=>{
+  let now=Date.now();t.mock.method(Date,"now",()=>now);
+  const requests:{url:URL;init?:RequestInit}[]=[];
+  const rows=Array.from({length:50},(_,index)=>work({id:`https://openalex.org/W${5000+index}`}));
+  const fetcher=fixtureFetch({meta:{count:500},results:rows},{total:200,documents:{D1:bankDocument()}},requests);
+  const original="I want research and case studies regarding mergers and acquisitions";
+  const first=await discoverDocuments(original,{fetcher});
+  const bankFirst=requests.find(request=>request.url.hostname==="search.worldbank.org")!.url;
+  assert.equal(bankFirst.searchParams.get("qterm"),"mergers acquisitions");
+  assert.equal(first.search?.candidatesChecked,51);assert.equal(first.search?.batch,0);assert.equal(first.search?.nextBatch,1);
+  assert.equal(requests.find(request=>request.url.hostname==="api.openalex.org")!.url.searchParams.get("per-page"),"50");
+  assert.equal(requests.find(request=>request.url.hostname==="api.crossref.org")!.url.searchParams.get("rows"),"75");
+  now+=2000;requests.length=0;
+  const second=await discoverDocuments(original,{fetcher,batch:1});
+  assert.notDeepEqual(second.search?.queryVariants,first.search?.queryVariants);
+  now+=2000;requests.length=0;
+  await discoverDocuments(original,{fetcher,batch:4});
+  assert.equal(requests.find(request=>request.url.hostname==="api.openalex.org")!.url.searchParams.get("page"),"2");
+  assert.equal(requests.find(request=>request.url.hostname==="search.worldbank.org")!.url.searchParams.get("os"),"50");
+  assert.equal(requests.find(request=>request.url.hostname==="api.crossref.org")!.url.searchParams.get("offset"),"75");
+});
+
+test("Existing URL aliases and DOIs are excluded before public document checks",async()=>{
+  const requests:string[]=[],fetcher=crossrefFixture([crossrefWork()],requests);
+  const result=await discoverDocuments(topic,{fetcher,excludeDois:["https://doi.org/10.1234/BANK.1"],excludeUrls:["https://repository.edu/papers/banking-ai.pdf?utm_source=previous"]});
+  assert.equal(result.documents.length,0);assert.equal(result.search?.candidatesChecked,1);
+  assert.equal(requests.filter(url=>url.includes("repository.edu")).length,0);
+});
+
+test("Exhaustion requires every query variant; failures remain retryable and the final batch is bounded",async t=>{
+  let now=Date.now();t.mock.method(Date,"now",()=>now);
+  const fetcher=fixtureFetch({results:[]},{documents:{}});
+  const continuationKey="test-exhaustion-unique";
+  const first=await discoverDocuments(topic,{fetcher,continuationKey});assert.equal(first.search?.nextBatch,1);
+  now+=2000;const second=await discoverDocuments(topic,{fetcher,batch:1,continuationKey});assert.equal(second.search?.nextBatch,2);
+  now+=2000;const third=await discoverDocuments(topic,{fetcher,batch:2,continuationKey});assert.equal(third.search?.nextBatch,null);assert.equal(third.search?.limitReached,undefined);
+  const limited=await discoverDocuments(topic,{fetcher:(async()=>new Response(null,{status:503})) as typeof fetch,batch:99});
+  assert.equal(limited.search?.batch,19);assert.equal(limited.search?.nextBatch,null);assert.equal(limited.search?.limitReached,true);
+});
+
+test("Broader corporate merger searches reject astrophysics and unrelated political mergers",async()=>{
+  const rows=[
+    work({id:"https://openalex.org/W8001",title:"Galaxy evolution in the post-merger regime",abstract_inverted_index:inverted("This study investigates galaxy mergers using stellar mass growth and gravitational models of merger activity."),doi:"10.1234/space"}),
+    work({id:"https://openalex.org/W8002",title:"The FATA-KP merger and administrative reform",abstract_inverted_index:inverted("This study evaluates the administrative merger of districts and changes in political representation, constitutional law and public administration."),doi:"10.1234/politics"}),
+    work({id:"https://openalex.org/W8003",title:"Post-merger integration in corporate acquisitions",abstract_inverted_index:inverted("This study evaluates merger integration, corporate governance and financial performance after company acquisitions."),doi:"10.1234/company"}),
+  ];
+  const result=await discoverDocuments("M&A case studies",{fetcher:fixtureFetch({results:rows},{documents:{}})});
+  assert.deepEqual(result.documents.map(document=>document.doi),["10.1234/company"]);
+});
+
+test("Subject matching can find the topic after twenty metadata words",async()=>{
+  const title="Evaluating measured operational organisational quantitative qualitative empirical comparative longitudinal retrospective prospective regional local international strategic practical technical analytical methodological descriptive causal explanatory predictive diagnostic outcomes: artificial intelligence in banking";
+  const result=await discoverDocuments("AI in banking",{fetcher:fixtureFetch({results:[work({title})]},{documents:{}})});
+  assert.equal(result.documents.length,1);
+});
+
+test("Each search retains eligible overflow records and cannot borrow another chain's exhaustion",async t=>{
+  let now=Date.now();t.mock.method(Date,"now",()=>now);
+  const rows=Array.from({length:30},(_,i)=>work({id:`https://openalex.org/W${9000+i}`,doi:`10.1234/carry${i}`,best_oa_location:{is_oa:true,landing_page_url:`https://repository.edu/papers/carry${i}`,pdf_url:null}}));
+  const requests:{url:URL;init?:RequestInit}[]=[];
+  const fetcher:typeof fetch=async(input,init)=>{
+    const url=new URL(String(input));requests.push({url,init});
+    return json(url.hostname==="api.openalex.org"?{meta:{count:30},results:url.searchParams.get("search")===topic?rows:[]}:url.hostname==="search.worldbank.org"?{documents:{}}:url.hostname==="api.crossref.org"?{status:"ok",message:{items:[]}}:{header:{numFound:0},results:[]});
+  };
+  const first=await discoverDocuments(topic,{fetcher,continuationKey:"test-search-chain-1"});assert.equal(first.documents.length,24);
+  now+=2000;
+  const next=await discoverDocuments(topic,{fetcher,batch:1,continuationKey:"test-search-chain-1",excludeDois:first.documents.map(document=>document.doi!)});
+  assert.equal(next.documents.length,6,"A later batch must include the previous page's eligible overflow.");
+  assert.ok(next.documents.every(document=>!first.documents.some(prior=>prior.doi===document.doi)));
+  now+=2000;
+  await discoverDocuments(topic,{fetcher,batch:2,continuationKey:"test-search-chain-1"});
+  now+=2000;
+  const fresh=await discoverDocuments(topic,{fetcher,continuationKey:"test-search-chain-2"});assert.equal(fresh.search?.nextBatch,1);assert.equal(fresh.documents.length,24);
+  assert.ok(requests.every(request=>!request.url.href.includes("test-search-chain")),"The internal continuation key must not be sent to providers.");
+});
+
+test("Repository author and browse lists cannot replace a specific open document",async()=>{
+  const rows=[work({open_access:{is_oa:true,oa_url:"https://eprints.leedsbeckett.ac.uk/view/creators/Du=3AM=3A=3A.html%3E"},best_oa_location:{is_oa:true,landing_page_url:"https://eprints.leedsbeckett.ac.uk/view/creators/Du=3AM=3A=3A.html%3E",pdf_url:null},locations:[{is_oa:true,landing_page_url:"https://repository.edu/record/actual-paper",pdf_url:"https://repository.edu/papers/actual-paper.pdf"}]}),
+    work({id:"https://openalex.org/W9999",doi:"10.1234/browse",open_access:{is_oa:true,oa_url:"https://repository.edu/browse?type=author"},best_oa_location:{is_oa:true,landing_page_url:"https://repository.edu/browse?type=author",pdf_url:null}})];
+  const result=await discoverDocuments(topic,{fetcher:fixtureFetch({results:rows},{documents:{}})});
+  assert.deepEqual(result.documents.map(document=>document.url),["https://repository.edu/record/actual-paper"]);
 });

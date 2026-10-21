@@ -10,7 +10,7 @@ export async function api(request:Request,write:boolean,handler:(db:D1Database,u
     if (write) {
       const origin = request.headers.get("origin");
       if ((origin && origin !== url.origin) || (!origin && !local) || request.headers.get("sec-fetch-site") === "cross-site") {
-        throw new ApiError("This action must come from your Research Atlas page.",403);
+        throw new ApiError("This action must come from your RadixAI page.",403);
       }
       if (!request.headers.get("content-type")?.includes("application/json")) throw new ApiError("Send this request as JSON.",415);
       if (Number(request.headers.get("content-length") || 0)>20_000) throw new ApiError("Request is too large.",413);
@@ -33,7 +33,7 @@ export async function api(request:Request,write:boolean,handler:(db:D1Database,u
     return Response.json(result,{headers:{"Cache-Control":"private, no-store","Vary":"oai-authenticated-user-id"}});
   } catch (error) {
     const known = error instanceof ApiError;
-    if (!known) console.error("Research Atlas API failed",error);
+    if (!known) console.error("RadixAI API failed",error);
     return Response.json({error:known?error.message:"The request could not be completed. Please retry shortly."},{status:known?error.status:500,headers:{"Cache-Control":"no-store"}});
   }
 }

@@ -19,7 +19,7 @@ test("Substantive public HTML is checked without authentication and returns its 
   assert.deepEqual(found,{url,kind:"html"});
   assert.equal(init?.redirect,"manual");assert.equal(init?.credentials,"omit");assert.equal(init?.referrerPolicy,"no-referrer");
   const headers=new Headers(init?.headers);assert.equal(headers.get("cookie"),null);assert.equal(headers.get("authorization"),null);
-  assert.match(headers.get("user-agent")||"",/https:\/\/signal-research-crawler\.sk1616\.chatgpt\.site\//);
+  assert.match(headers.get("user-agent")||"",/https:\/\/radixai\.sk1616\.chatgpt\.site\//);
 });
 
 test("Only a successful PDF response with initial PDF magic qualifies; its body is cancelled",async()=>{

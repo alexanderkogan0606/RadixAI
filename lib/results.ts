@@ -5,6 +5,8 @@ import { assessResource } from "./resource-quality.ts";
 import { canonicalEvidenceUrl } from "./discovery-store.ts";
 // @ts-expect-error Node's native TypeScript runner needs the explicit extension.
 import { isFilingQuery } from "./filing-discovery.ts";
+// @ts-expect-error Node's native TypeScript runner needs the explicit extension.
+import { documentIdentityKeys } from "./document-identity.ts";
 export type ResultAccess="Free"|"Freemium"|"Mixed"|"Paid"|"Unknown";
 export type ResultClassifier=(page:{url:string;sourceId?:string})=>ResultAccess;
 export type ResourceAssessment={eligible:boolean;reason:string|null;matchedTerms:string[];score:number};
@@ -61,7 +63,12 @@ export async function readResults(db:D1Database,user:string,params:URLSearchPara
   if(filters.jobId&&!initial[0].results.length)throw new ResultsError("Crawl run not found.",404);
   const evidence=new Map<string,Row>();
   for(const row of initial[1].results){evidence.set(canonicalKey(row.url),row);if(row.full_text_url)evidence.set(canonicalKey(row.full_text_url),row);}
-  const seen=new Set<string>(),chosen=new Map<string,Candidate>();
+  const seen=new Set<string>(),chosen=new Map<string,Candidate>(),candidatesByIdentity:{key:string;candidate:Candidate}[]=[],identityParents=new Map<string,string>();
+  const identityRoot=(key:string):string=>{let root=key;while(identityParents.has(root)&&identityParents.get(root)!==root)root=identityParents.get(root)!;let next=key;while(identityParents.has(next)&&identityParents.get(next)!==root){const parent=identityParents.get(next)!;identityParents.set(next,root);next=parent;}return root;};
+  const identity=(row:Row):string=>{
+    const keys=[`url:${canonicalKey(row.url)}`,...documentIdentityKeys({url:String(row.url),fullTextUrl:row.full_text_url?String(row.full_text_url):undefined,doi:row.doi?String(row.doi):undefined})];
+    const root=identityRoot(keys[0]);for(const key of keys)identityParents.set(identityRoot(key),root);return root;
+  };
   let rawTotal=0,crawlTotal=0,discoveryTotal=0,boundary:Row|null=null;
   while(true){
     const boundarySql:string=boundary?"WHERE collected_at<? OR (collected_at=? AND id<?)":"";
@@ -69,7 +76,7 @@ export async function readResults(db:D1Database,user:string,params:URLSearchPara
     const batch:Row[]=(await statement(db,`SELECT * FROM (${combined}) ${boundarySql} ORDER BY collected_at DESC,id DESC LIMIT ${SCAN_SIZE}`,user,user,...values).all<Row>()).results;
     for(const row of batch){
       rawTotal++;if(row.origin==="discovery")discoveryTotal++;else crawlTotal++;
-      const key=canonicalKey(row.url);seen.add(key);
+      const key=canonicalKey(row.url),identityKey=identity(row);seen.add(identityKey);
       if(filters.jobId&&(row.origin!=="crawl"||row.job_id!==filters.jobId))continue;
       if(filters.saved&&!row.saved)continue;
       if(filters.q&&![row.title,row.description,row.url,row.tags,row.domain,row.category,row.query,row.queries,row.provider].join("\n").toLowerCase().includes(filters.q.toLowerCase()))continue;
@@ -87,11 +94,14 @@ export async function readResults(db:D1Database,user:string,params:URLSearchPara
       }
       const rank=(quality.eligible?4:0)+(access==="Free"?2:0)+(row.origin==="discovery"?1:0);
       const candidate:Candidate={id:String(row.id),time:String(row.collected_at),origin:String(row.origin),access,quality,rank};
-      const previous=chosen.get(key);
-      // Keep a substantive free document in preference to a duplicate gate or navigation capture.
-      if(!previous||rank>previous.rank)chosen.set(key,candidate);
+      candidatesByIdentity.push({key:identityKey,candidate});
     }
     if(batch.length<SCAN_SIZE)break;boundary=batch[batch.length-1];
+  }
+  for(const {key,candidate} of candidatesByIdentity){
+    const group=identityRoot(key),previous=chosen.get(group);
+    // Keep a substantive free document in preference to a duplicate gate or navigation capture.
+    if(!previous||candidate.rank>previous.rank)chosen.set(group,candidate);
   }
   let filteredTotal=0,excludedAccessCount=0,excludedQualityCount=0;
   const candidates:Candidate[]=[];
@@ -109,5 +119,6 @@ export async function readResults(db:D1Database,user:string,params:URLSearchPara
   const byId=new Map(fullRows.map(row=>[String(row.id),row]));
   const pages=selected.flatMap(candidate=>{const row=byId.get(candidate.id);return row?[serialize(row,candidate,evidence.get(canonicalKey(row.url)))]:[];});
   const last=selected[selected.length-1];
-  return {pages,total:seen.size,rawTotal,crawlTotal,discoveryTotal,duplicateCount:rawTotal-seen.size,filteredTotal,excludedAccessCount,excludedQualityCount,nextCursor:candidates.length>PAGE_SIZE&&last?encodeCursor({v:2,time:last.time,id:last.id,...filters}):null};
+  const total=new Set([...seen].map(identityRoot)).size;
+  return {pages,total,rawTotal,crawlTotal,discoveryTotal,duplicateCount:rawTotal-total,filteredTotal,excludedAccessCount,excludedQualityCount,nextCursor:candidates.length>PAGE_SIZE&&last?encodeCursor({v:2,time:last.time,id:last.id,...filters}):null};
 }

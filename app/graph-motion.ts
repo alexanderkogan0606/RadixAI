@@ -1,6 +1,6 @@
 export type Spring={value:number;velocity:number};
-export type Target={key:string;x:number;y:number};
-export type MovingPoint={x:Spring;y:Spring;targetX:number;targetY:number;alpha:number;born:number;phase:number;branchPhase:number};
+export type Target={key:string;x:number;y:number;z?:number};
+export type MovingPoint={x:Spring;y:Spring;z:Spring;targetX:number;targetY:number;targetZ:number;alpha:number;born:number;phase:number;branchPhase:number};
 
 export function hashPhase(key:string){let h=2166136261;for(let i=0;i<key.length;i++)h=Math.imul(h^key.charCodeAt(i),16777619);return (h>>>0)/4294967295*Math.PI*2}
 
@@ -23,19 +23,19 @@ export class GraphMotion{
     for(const key of this.points.keys())if(!keep.has(key))this.points.delete(key);
     for(const target of targets){
       const point=this.points.get(target.key);
-      if(point){point.targetX=target.x;point.targetY=target.y;continue}
+      if(point){point.targetX=target.x;point.targetY=target.y;point.targetZ=target.z||0;continue}
       const parentKey=parents.get(target.key)||'';
       // Resolve through newly arriving ancestors as well, regardless of input order.
-      let ancestor=parentKey,x=target.x,y=target.y;
+      let ancestor=parentKey,x=target.x,y=target.y,z=target.z||0;
       const visited=new Set([target.key]);
       while(ancestor&&!visited.has(ancestor)){
         visited.add(ancestor);
         const parent=this.points.get(ancestor),parentTarget=targetMap.get(ancestor);
-        if(parent){x=parent.x.value;y=parent.y.value;break}
-        if(parentTarget){x=parentTarget.x;y=parentTarget.y}
+        if(parent){x=parent.x.value;y=parent.y.value;z=parent.z.value;break}
+        if(parentTarget){x=parentTarget.x;y=parentTarget.y;z=parentTarget.z||0}
         ancestor=parents.get(ancestor)||'';
       }
-      this.points.set(target.key,{x:{value:x,velocity:0},y:{value:y,velocity:0},targetX:target.x,targetY:target.y,alpha:0,born:now,phase:hashPhase(target.key),branchPhase:hashPhase(parentKey||target.key)});
+      this.points.set(target.key,{x:{value:x,velocity:0},y:{value:y,velocity:0},z:{value:z,velocity:0},targetX:target.x,targetY:target.y,targetZ:target.z||0,alpha:0,born:now,phase:hashPhase(target.key),branchPhase:hashPhase(parentKey||target.key)});
     }
   }
   advance(seconds:number,now:number,reducedMotion=false){
@@ -43,6 +43,7 @@ export class GraphMotion{
     for(const point of this.points.values()){
       moving=stepSpring(point.x,point.targetX,seconds,reducedMotion)||moving;
       moving=stepSpring(point.y,point.targetY,seconds,reducedMotion)||moving;
+      moving=stepSpring(point.z,point.targetZ,seconds,reducedMotion)||moving;
       const progress=reducedMotion?1:Math.max(0,Math.min(1,(now-point.born)/650));
       point.alpha=progress*progress*(3-2*progress);
       moving=progress<1||moving;

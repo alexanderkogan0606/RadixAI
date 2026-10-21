@@ -23,7 +23,7 @@ test("Specific quarterly requests return the primary SEC filing and factual peri
   const result=await discoverDocuments("Apple latest quarterly report",{fetcher:fixture(payload(),requests)});
   assert.equal(result.providers.length,1);assert.equal(result.providers[0].provider,"SEC EDGAR");assert.equal(result.providers[0].status,"ok");
   assert.equal(requests.length,1);assert.equal(requests[0].url,"https://data.sec.gov/submissions/CIK0000320193.json");
-  assert.equal(requests[0].init?.redirect,"manual");assert.match(String(new Headers(requests[0].init?.headers).get("User-Agent")),/signal-research-crawler\.sk1616\.chatgpt\.site/);
+  assert.equal(requests[0].init?.redirect,"manual");assert.match(String(new Headers(requests[0].init?.headers).get("User-Agent")),/radixai\.sk1616\.chatgpt\.site/);
   assert.equal(result.documents.length,1);const document=result.documents[0];
   assert.equal(document.url,"https://www.sec.gov/Archives/edgar/data/320193/000032019325000080/aapl-20250628.htm");
   assert.equal(document.fullTextUrl,document.url);assert.equal(document.type,"Quarterly report");assert.equal(document.access,"Free");

@@ -2,7 +2,7 @@
 
 The elements below were opened and their rendered CSS editors inspected on October 21, 2026. Each element page displays the MIT license. These are local adaptations; the app does not load Uiverse scripts, assets or tracking code.
 
-| Adaptation | Original element and author | Changes for Research Atlas |
+| Adaptation | Original element and author | Changes for RadixAI |
 | --- | --- | --- |
 | Button hover and press feedback | [Button: evil-monkey-41](https://uiverse.io/cssbuttons-io/evil-monkey-41), [cssbuttons-io](https://uiverse.io/profile/cssbuttons-io) | Adapted the raised-front transform, easing and quick press response to existing `.button` and `.research-send` elements. Reduced travel to 1px, kept the app's colors, removed layered spans, gradients and brightness filters. Added disabled and reduced-motion handling. |
 | Static dotted surface | [Pattern: short-warthog-33](https://uiverse.io/kennyotsu/short-warthog-33), [kennyotsu / kotsu](https://uiverse.io/profile/kennyotsu) | Adapted the radial dot grid to 0.8px dots on a 20px grid with lower contrast. Used only on bounded loading panels or surfaces explicitly given `.atlas-dot-surface`. |

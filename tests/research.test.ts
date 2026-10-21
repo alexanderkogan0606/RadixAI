@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 // @ts-expect-error Node's native TypeScript runner requires the explicit extension.
-import { researchAnswer,resolveResearchQuery,cleanHistory,retrieveForUser,saveChat,readChat,type ResearchSource } from "../lib/research.ts";
+import { researchAnswer,resolveResearchQuery,cleanHistory,retrieveForUser,saveChat,readChat,runResearchRequest,ResearchRequestError,type ResearchSource } from "../lib/research.ts";
+// @ts-expect-error Node's native TypeScript runner requires the explicit extension.
+import {saveDiscoveredDocuments} from "../lib/discovery-store.ts";
 
 const catalog:ResearchSource[]=[{id:"free-library",name:"Generic Research Library",url:"https://publicresearch.org/",domain:"Business",category:"Research",type:"Research library",access:"Free",description:"SaaS pricing, artificial intelligence in banking, and mergers research library.",tags:["SaaS","banking","mergers"],geography:"Global",crawlMethod:"Manual",verification:"Discovery seed"}];
 const emptyDiscovery={documents:[],providers:[{provider:"OpenAlex" as const,status:"empty" as const,count:0,message:"No matching documents returned."},{provider:"World Bank" as const,status:"empty" as const,count:0,message:"No matching documents returned."}],searchedAt:"2026-10-21T10:00:00.000Z"};
@@ -33,12 +35,26 @@ function providerWork(topic:"pricing"|"banking"|"merger"){
   const url=`https://repository.edu/record/${topic}`;
   return {id:`https://openalex.org/W${details.id}`,title:details.title,doi:`https://doi.org/10.1234/${topic}`,publication_date:"2025-01-02",type:"article",open_access:{is_oa:true,oa_url:url},best_oa_location:{is_oa:true,landing_page_url:url,pdf_url:null},abstract_inverted_index:abstract};
 }
+function fixturePayload(hostname:string,works:unknown[]){return hostname==="api.openalex.org"?{results:works}:hostname==="api.openaire.eu"?{results:[],header:{numFound:0}}:hostname==="api.crossref.org"?{message:{items:[],"total-results":0}}:{documents:{},total:0};}
 function liveFixture(requests:string[]=[]):typeof fetch{
   return (async(input:RequestInfo|URL)=>{
     const url=new URL(String(input)),query=url.searchParams.get("search")||url.searchParams.get("qterm")||"";requests.push(query);
     const topic=/bank/i.test(query)?"banking":/merger|acquisition/i.test(query)?"merger":"pricing";
-    return new Response(JSON.stringify(url.hostname==="api.openalex.org"?{results:[providerWork(topic)]}:{documents:{}}),{headers:{"content-type":"application/json"}});
+    return new Response(JSON.stringify(fixturePayload(url.hostname,[providerWork(topic)])),{headers:{"content-type":"application/json"}});
   }) as typeof fetch;
+}
+function continuationFixture(requests:string[]=[]):typeof fetch{
+  const original=providerWork("pricing"),url="https://repository.edu/record/pricing-next";
+  const next={...original,id:"https://openalex.org/W124",title:"SaaS pricing and retention across software subscription cohorts",doi:"https://doi.org/10.1234/pricing-next",open_access:{is_oa:true,oa_url:url},best_oa_location:{is_oa:true,landing_page_url:url,pdf_url:null}};
+  const duplicateUrl="https://another-repository.edu/record/pricing";
+  const duplicate={...original,id:"https://openalex.org/W125",doi:"https://doi.org/10.1234/PRICING",open_access:{is_oa:true,oa_url:duplicateUrl},best_oa_location:{is_oa:true,landing_page_url:duplicateUrl,pdf_url:null}};
+  return (async(input:RequestInfo|URL)=>{const address=new URL(String(input));requests.push(String(input));return new Response(JSON.stringify(fixturePayload(address.hostname,[original,duplicate,next])),{headers:{"content-type":"application/json"}});}) as typeof fetch;
+}
+async function seedContinuableSearch(db:D1Database,user="alice"){
+  const result=await retrieveForUser(db,user,"SaaS pricing",[],catalog,{fetcher:liveFixture()});
+  // A durable provider checkpoint, independent of the fixture provider's available page count.
+  result.search={...result.search!,batch:0,nextBatch:1,canContinue:true};
+  return {...result,...await saveChat(db,user,"SaaS pricing",result)};
 }
 
 test("A new topic resets historical context; only topic-less followups inherit it",()=>{
@@ -101,7 +117,7 @@ test("Live research persists specific documents, changes results by query, and p
     assert.deepEqual(pricing.plan.sourceIds,[pricing.documents[0].id]);assert.deepEqual(pricing.plan.urls,[pricing.documents[0].url]);
     assert.deepEqual(pricing.sources,[]);assert.equal(pricing.mode,"retrieval");assert.match(pricing.answer,/Provider summary/);assert.match(pricing.answer,/have not read or analyzed the full documents/);
     assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_documents WHERE user_id='alice'").get()?.n),3);
-    assert.deepEqual(requests,["SaaS pricing","SaaS pricing","Artificial intelligence in banking","Artificial intelligence in banking","mergers and acquisitions case studies","mergers and acquisitions case studies"]);
+    assert.ok(requests.some(query=>/saas pricing/i.test(query)));assert.ok(requests.some(query=>/banking/i.test(query)));assert.ok(requests.some(query=>/merger|acquisition/i.test(query)));
   }finally{sqlite.close();}
 });
 
@@ -160,5 +176,211 @@ test("A quarterly filing survives persistence and chat replay without academic o
     assert.deepEqual(result.plan.urls,[result.documents[0].url]);
     await saveChat(db,"alice",query,result);const replay=await readChat(db,"alice");
     assert.equal(replay.messages[1].documents?.[0].documentType,"Quarterly report");assert.equal(replay.messages[1].providers?.[0].provider,"SEC EDGAR");
+  }finally{sqlite.close();}
+});
+
+test("Continuation uses the owned saved query and returns new documents first with accurate cumulative counts",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db),requests:string[]=[];
+    const more=await runResearchRequest(db,"alice",{continueFrom:first.id,message:"Search an unrelated subject",history:[{role:"user",content:"Unrelated subject"}]},catalog,{fetcher:continuationFixture(requests)});
+    assert.equal(more.plan.query,"SaaS pricing");assert.equal(more.documents.length,2);
+    assert.match(more.documents[0].url,/pricing-next$/);assert.equal(more.documents[1].id,first.documents[0].id);
+    assert.equal(more.search?.batch,1);assert.equal(more.search?.parentMessageId,first.id);assert.equal(more.search?.chainId,first.search?.chainId);
+    assert.equal(more.search?.newDocumentsCount,1);assert.equal(more.search?.totalDocuments,2);
+    assert.equal(more.search?.newCount,1);assert.equal(more.search?.totalCount,2);
+    assert.match(more.answer,/1 new free document in this batch; 2 collected/);
+    assert.deepEqual(more.plan.sourceIds,more.documents.map(document=>document.id));
+    assert.ok(requests.every(url=>!url.includes("Unrelated")));
+    const stored=sqlite.prepare("SELECT metadata FROM atlas_chat WHERE id=?").get(more.id);
+    const metadata=JSON.parse(String(stored?.metadata));
+    assert.deepEqual(metadata.documents,[]);assert.deepEqual(metadata.documentIds,more.documents.map(document=>document.id));
+    assert.ok(!String(stored?.metadata).includes(more.documents[0].description),"Full abstracts are stored only in the documents table.");
+    const replay=await readChat(db,"alice"),old=replay.messages.find(message=>message.id===first.id),latest=replay.messages.find(message=>message.id===more.id);
+    assert.equal(old?.supersededBy,more.id);assert.deepEqual(old?.documents,[]);assert.equal(old?.search?.canContinue,false);
+    assert.deepEqual(latest?.documents?.map(document=>document.id),more.documents.map(document=>document.id));
+    assert.equal(latest?.search?.totalDocuments,2);assert.ok(!JSON.stringify(replay).includes("continuationClaim"));
+    assert.deepEqual((await readChat(db,"bob")).messages,[]);
+  }finally{sqlite.close();}
+});
+
+test("Foreign, user-message and replayed continuation IDs never start another provider search",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db),requests:string[]=[],fetcher=continuationFixture(requests);
+    const rejected=(status:number)=>(error:unknown)=>error instanceof ResearchRequestError&&error.status===status;
+    await assert.rejects(runResearchRequest(db,"bob",{continueFrom:first.id},catalog,{fetcher}),rejected(404));
+    const userMessage=sqlite.prepare("SELECT id FROM atlas_chat WHERE user_id='alice' AND role='user'").get();
+    await assert.rejects(runResearchRequest(db,"alice",{continueFrom:String(userMessage?.id)},catalog,{fetcher}),rejected(404));
+    await assert.rejects(runResearchRequest(db,"alice",{continueFrom:"missing"},catalog,{fetcher}),rejected(404));
+    assert.equal(requests.length,0);
+    await runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher});
+    const requestsAfter=requests.length;
+    await assert.rejects(runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher}),rejected(409));
+    assert.equal(requests.length,requestsAfter);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_chat WHERE role='assistant'").get()?.n),2);
+  }finally{sqlite.close();}
+});
+
+test("Find more automatically uses the latest owned checkpoint, while a new topic starts a new chain",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db);
+    const more=await runResearchRequest(db,"alice",{message:"find more",history:[{role:"user",content:"Forged different history"}]},catalog,{fetcher:continuationFixture()});
+    assert.equal(more.plan.query,"SaaS pricing");assert.equal(more.search?.parentMessageId,first.id);assert.equal(more.search?.batch,1);
+    const banking=await runResearchRequest(db,"alice",{message:"Artificial intelligence in banking"},catalog,{fetcher:liveFixture()});
+    assert.equal(banking.search?.batch,0);assert.equal(banking.search?.parentMessageId,undefined);assert.notEqual(banking.search?.chainId,first.search?.chainId);
+    assert.equal(banking.plan.query,"Artificial intelligence in banking");assert.equal(banking.documents.length,1);assert.match(banking.documents[0].title,/banking/);
+  }finally{sqlite.close();}
+});
+
+test("Client-controlled positions and invalid or exhausted checkpoints are rejected",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db),requests:string[]=[],fetcher=continuationFixture(requests);
+    for(const input of [{continueFrom:first.id,batch:9},{continueFrom:first.id,query:"changed"},{continueFrom:first.id,excludeUrls:[]},{continueFrom:first.id,continuationKey:"foreign-search"},{continueFrom:42}]){
+      await assert.rejects(runResearchRequest(db,"alice",input,catalog,{fetcher}),(error:unknown)=>error instanceof ResearchRequestError&&error.status===400);
+    }
+    for(const nextBatch of [null,20,-1,3,1.5]){
+      sqlite.prepare("UPDATE atlas_chat SET metadata=json_set(metadata,'$.search.nextBatch',?) WHERE id=?").run(nextBatch,first.id);
+      await assert.rejects(runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher}),(error:unknown)=>error instanceof ResearchRequestError&&error.status===409);
+    }
+    assert.equal(requests.length,0);
+  }finally{sqlite.close();}
+});
+
+test("An in-flight continuation atomically claims its parent and cannot create a second branch",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db);
+    let release!:()=>void,entered!:()=>void;
+    const barrier=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{entered=resolve;});
+    const fixture=continuationFixture(),fetcher=(async(input:RequestInfo|URL,init?:RequestInit)=>{entered();await barrier;return fixture(input,init);}) as typeof fetch;
+    const pending=runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher});
+    await started;
+    await assert.rejects(runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher:continuationFixture()}),(error:unknown)=>error instanceof ResearchRequestError&&error.status===409);
+    release();const result=await pending;
+    assert.equal(result.search?.newDocumentsCount,1);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_chat WHERE role='assistant'").get()?.n),2);
+  }finally{sqlite.close();}
+});
+
+test("A failed chat save releases its checkpoint and permits a safe retry without duplicate documents",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db);
+    let failSave=true;
+    const interrupted={...db,batch:async(statements:D1PreparedStatement[])=>{
+      if(failSave&&statements.some(statement=>(statement as unknown as {sql:string}).sql.includes("INSERT INTO atlas_chat"))){failSave=false;throw new Error("Simulated chat persistence failure");}
+      return db.batch(statements);
+    }} as D1Database;
+    await assert.rejects(runResearchRequest(interrupted,"alice",{continueFrom:first.id},catalog,{fetcher:continuationFixture()}),/Simulated chat persistence failure/);
+    const parent=JSON.parse(String(sqlite.prepare("SELECT metadata FROM atlas_chat WHERE id=?").get(first.id)?.metadata));
+    assert.equal(parent.search.continuationClaim,undefined);assert.equal(parent.search.canContinue,true);assert.equal(parent.search.continuedBy,undefined);
+    const retried=await runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher:continuationFixture()});
+    assert.equal(retried.documents.length,2);assert.equal(retried.search?.newDocumentsCount,0);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_documents WHERE user_id='alice'").get()?.n),2);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_chat WHERE role='assistant'").get()?.n),2);
+  }finally{sqlite.close();}
+});
+
+test("Expired worker claims become continuable on reload and can be reclaimed without exposing claim tokens",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db);
+    sqlite.prepare("UPDATE atlas_chat SET metadata=json_set(metadata,'$.search.continuationClaim','abandoned-worker','$.search.continuationClaimedUntil',0,'$.search.canContinue',json('false')) WHERE id=?").run(first.id);
+    const restored=await readChat(db,"alice"),message=restored.messages.find(message=>message.id===first.id);
+    assert.equal(message?.search?.canContinue,true);assert.ok(!JSON.stringify(restored).includes("abandoned-worker"));
+    const more=await runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher:continuationFixture()});
+    assert.equal(more.search?.parentMessageId,first.id);assert.equal(more.search?.newDocumentsCount,1);
+  }finally{sqlite.close();}
+});
+
+test("Twenty sequential batches keep durable owner-scoped checkpoints and compact cumulative plans",async()=>{
+  const {db,sqlite}=database();
+  try{
+    let searches=0,requests=0;
+    const fetcher=(async(input:RequestInfo|URL)=>{
+      requests++;const address=new URL(String(input));
+      if(address.hostname!=="api.openalex.org")return new Response(JSON.stringify(fixturePayload(address.hostname,[])),{headers:{"content-type":"application/json"}});
+      const index=searches++,url=`https://repository.edu/record/pricing-${index}`,original=providerWork("pricing");
+      const work={...original,id:`https://openalex.org/W${3000+index}`,doi:`https://doi.org/10.1234/pricing-${index}`,title:`SaaS pricing and customer retention in software subscription cohort ${index}`,open_access:{is_oa:true,oa_url:url},best_oa_location:{is_oa:true,landing_page_url:url,pdf_url:null}};
+      return new Response(JSON.stringify({results:[work],meta:{count:100000}}),{headers:{"content-type":"application/json"}});
+    }) as typeof fetch;
+    let current=await runResearchRequest(db,"alice",{message:"SaaS pricing"},catalog,{fetcher});
+    const chainId=current.search?.chainId,ids:string[]=[];
+    for(let batch=0;batch<20;batch++){
+      if(batch){const parentId=current.id;current=await runResearchRequest(db,"alice",{continueFrom:parentId},catalog,{fetcher});assert.equal(current.search?.parentMessageId,parentId);}
+      ids.push(current.id);assert.equal(current.search?.batch,batch);assert.equal(current.search?.chainId,chainId);
+      assert.equal(current.search?.newDocumentsCount,1);assert.equal(current.search?.totalDocuments,batch+1);
+      assert.equal(current.documents.length,batch+1);assert.match(current.documents[0].url,new RegExp(`pricing-${batch}$`));
+      assert.equal(current.search?.nextBatch,batch===19?null:batch+1);assert.equal(current.search?.canContinue,batch<19);
+      const stored=JSON.parse(String(sqlite.prepare("SELECT metadata FROM atlas_chat WHERE id=?").get(current.id)?.metadata));
+      assert.deepEqual(stored.documents,[]);assert.deepEqual(stored.plan.sourceIds,[]);assert.deepEqual(stored.plan.urls,[]);
+      assert.equal(stored.documentIds.length,batch+1);assert.ok(JSON.stringify(stored).length<15000);
+    }
+    const loaded=await readChat(db,"alice"),assistants=loaded.messages.filter(message=>message.role==="assistant");
+    assert.equal(loaded.messages.length,40);assert.equal(assistants.length,20);assert.equal(assistants.at(-1)?.documents?.length,20);
+    assert.deepEqual(assistants.at(-1)?.plan,current.plan);assert.equal(assistants.at(-1)?.search?.nextBatch,null);
+    for(const [index,message] of assistants.slice(0,-1).entries()){
+      assert.equal(message.id,ids[index]);assert.equal(message.supersededBy,current.id);assert.deepEqual(message.documents,[]);
+      assert.deepEqual(message.plan?.urls,[]);assert.equal(message.search?.totalDocuments,index+1);assert.equal(message.search?.canContinue,false);
+    }
+    assert.deepEqual((await readChat(db,"bob")).messages,[]);
+    const before=requests;
+    await assert.rejects(runResearchRequest(db,"alice",{continueFrom:current.id},catalog,{fetcher}),(error:unknown)=>error instanceof ResearchRequestError&&error.status===409);
+    assert.equal(requests,before);assert.equal(searches,20);
+  }finally{sqlite.close();}
+});
+
+test("A provider outage preserves collected documents and leaves a durable continuation checkpoint",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db);
+    const more=await runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher:(async()=>new Response("unavailable",{status:503})) as typeof fetch});
+    assert.equal(more.search?.newDocumentsCount,0);assert.equal(more.search?.totalDocuments,1);assert.equal(more.search?.nextBatch,2);
+    assert.equal(more.search?.canContinue,true);assert.deepEqual(more.documents.map(document=>document.id),first.documents.map(document=>document.id));
+    assert.ok(more.providers.every(provider=>!["ok","empty"].includes(provider.status)));
+    assert.match(more.answer,/0 new free documents in this batch; 1 collected/);
+    const latest=(await readChat(db,"alice")).messages.find(message=>message.id===more.id);
+    assert.equal(latest?.search?.nextBatch,2);assert.deepEqual(latest?.plan,more.plan);
+  }finally{sqlite.close();}
+});
+
+test("A document persistence failure can retry its checkpoint without losing provider matches",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const first=await seedContinuableSearch(db),fetcher=continuationFixture();
+    let failSave=true;
+    const interrupted={...db,batch:async(statements:D1PreparedStatement[])=>{
+      if(failSave&&statements.some(statement=>(statement as unknown as {sql:string}).sql.includes("INSERT INTO atlas_documents"))){failSave=false;throw new Error("Simulated document persistence failure");}
+      return db.batch(statements);
+    }} as D1Database;
+    await assert.rejects(runResearchRequest(interrupted,"alice",{continueFrom:first.id},catalog,{fetcher}),/Simulated document persistence failure/);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_documents").get()?.n),1);
+    const retried=await runResearchRequest(db,"alice",{continueFrom:first.id},catalog,{fetcher});
+    assert.equal(retried.search?.newDocumentsCount,1);assert.equal(retried.documents.length,2);
+    assert.match(retried.documents[0].url,/pricing-next$/);
+  }finally{sqlite.close();}
+});
+
+test("Latest chat hydration corrects historical topic and identity counts without rewriting its raw archive",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const query="Mergers and acquisitions case studies",base={description:"This report studies corporate acquisitions, financial performance and shareholder outcomes with comparative company evidence.",provider:"OpenAlex",providerRecordUrl:"https://openalex.org/W123",access:"Free" as const,accessBasis:"Provider open-access evidence for this document.",type:"Research paper",domain:"Finance",query,foundAt:"2026-10-21T00:00:00.000Z"};
+    const documents=await saveDiscoveredDocuments(db,"alice",query,[
+      {...base,id:"land",title:"Land acquisition and involuntary resettlement policy",description:"This report studies land acquisition compensation and resettlement in infrastructure financing projects.",url:"https://repository.edu/reports/land"},
+      {...base,id:"old",title:"Corporate acquisitions and shareholder performance outcomes",url:"https://zenodo.org/record/7050039",doi:"10.5281/zenodo.7050038"},
+      {...base,id:"alias",title:"Corporate acquisitions and shareholder performance outcomes",url:"https://zenodo.org/records/7050039",doi:"10.5281/zenodo.7050039"},
+      {...base,id:"minority",title:"Minority shareholder expropriation in corporate acquisitions",url:"https://repository.edu/reports/shareholders"},
+    ]);
+    const result={...researchAnswer(query,[],catalog),documents,answer:"I found 4 new free documents; 4 collected.",search:{batch:0,nextBatch:1,chainId:crypto.randomUUID(),candidatesChecked:4,queryVariants:[query],newDocumentsCount:4,totalDocuments:4,newCount:4,totalCount:4,canContinue:true}};
+    const saved=await saveChat(db,"alice",query,result),before=sqlite.prepare("SELECT metadata FROM atlas_chat WHERE id=?").get(saved.id)?.metadata;
+    const latest=(await readChat(db,"alice")).messages.find(message=>message.id===saved.id)!;
+    assert.equal(latest.documents?.length,2);assert.equal(latest.search?.totalDocuments,2);assert.equal(latest.search?.newDocumentsCount,2);
+    assert.match(latest.content,/2 new free documents in this batch; 2 collected/);assert.equal(latest.plan?.urls.length,2);
+    assert.ok(latest.documents?.some(document=>document.title.includes("expropriation")));assert.ok(!latest.documents?.some(document=>document.title.startsWith("Land")));
+    assert.equal(sqlite.prepare("SELECT metadata FROM atlas_chat WHERE id=?").get(saved.id)?.metadata,before);
+    assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_documents").get()?.n),4);
   }finally{sqlite.close();}
 });

@@ -63,3 +63,20 @@ test("link discovery prioritizes related anchors and paths and rejects account/l
   for(const url of ["https://research.org/login","https://research.org/account/profile","https://research.org/privacy","https://research.org/article?sessionid=secret"]){assert.equal(linkPriority({url},query),-1)}
   assert.ok(linkPriority({url:"https://research.org/research"},query)>=0,"useful collections remain traversable");
 });
+
+
+test("conversational framing does not reduce topic relevance or narrow provider queries",()=>{
+  const query="I want research and case studies regarding mergers and acquisitions";
+  assert.deepEqual(queryTerms(query),["merger"]);
+  assert.equal(cleanSearchQuery(query),"mergers and acquisitions");
+  assert.equal(assessResource(article,query).eligible,true);
+  assert.deepEqual(queryTerms("I need specific resources concerning AI banking"),["ai","bank"]);
+  assert.equal(cleanSearchQuery("I'm looking for research on SaaS pricing"),"SaaS pricing");
+  assert.equal(cleanSearchQuery("I want bank mergers"),"bank mergers");
+  assert.ok(queryTerms("consumer needs and demand forecasting").includes("demand"));
+});
+
+test("SaaS and its expanded name describe the same research subject",()=>{
+  assert.deepEqual(queryTerms("software-as-a-service pricing"),["saas","price"]);
+  assert.equal(assessResource({url:"https://research.org/paper/42",title:"Software as a service pricing strategies",description:"This study compares subscription pricing and customer retention in software service businesses."},"SaaS pricing").eligible,true);
+});

@@ -12,7 +12,7 @@ export interface CrawlMetricsInput {
 }
 export interface CrawlWebsiteMetric {hostname:string;discovered:number;checked:number;queued:number;processing:number;failed:number;percent:number}
 const supplementalStop=new Set("home welcome contact privacy cookies cookie terms rights reserved copyright login signin signup account subscribe subscription navigation menu next previous click download website site public metadata summary abstract description read analyzed captured fetched independently source available unavailable filed period ended accession document title http https www org com pdf html doi license version".split(" "));
-const limits={pages:300,frontier:5000,events:1000,edges:10000};
+const limits={pages:1000,frontier:5000,events:1000,edges:10000};
 const time=(value:unknown):number|null=>{const result=typeof value==="number"?value:typeof value==="string"&&value?Date.parse(value):NaN;return Number.isFinite(result)?result:null;};
 const clean=(value:unknown):string=>typeof value==="string"?value.slice(0,16000).replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi," ").replace(/<[^>]*>/g," ").replace(/&amp;|&#38;/gi,"&").replace(/&nbsp;|&#160;/gi," ").replace(/\s+/g," ").trim():"";
 function address(value:string):{url:string;hostname:string}|null {try{const url=new URL(value);if(!/^https?:$/.test(url.protocol))return null;url.hash="";return {url:url.href,hostname:url.hostname.toLowerCase().replace(/^www\./,"").replace(/\.$/,"")};}catch{return null;}}
@@ -25,12 +25,13 @@ function metadataWords(value:string):string[]{
   return normalized.match(/[\p{L}\p{N}]+/gu)||[];
 }
 
-/** Pure and deterministic: the caller supplies the clock and replay-filtered arrays. */
-export function computeCrawlMetrics(input:CrawlMetricsInput={}) {
-  const pages=input.pages||[],frontier=input.frontier||[],events=input.events||[],edges=input.edges||[];
+/** Reuse this result while pages and query are unchanged; telemetry polls need no text analysis. */
+export function computeCrawlMetadata(input:Pick<CrawlMetricsInput,"pages"|"query">={}) {
+  const pages=input.pages||[];
   const wanted=queryTerms(input.query||""),canonical=new Map<string,string|undefined>();
   const normalize=(word:string)=>{if(!canonical.has(word))canonical.set(word,queryTerms(word)[0]);return canonical.get(word);};
-  const analyzed=pages.slice(-limits.pages).map((page,index)=>{
+  const recentPages=pages.map((page,index)=>({page,index,at:time(page.fetchedAt)})).sort((a,b)=>(a.at??0)-(b.at??0)||a.index-b.index).slice(-limits.pages);
+  const analyzed=recentPages.map(({page,index})=>{
     const title=clean(page.title||page.name),description=clean(page.description),metadata=`${title} ${description}`.trim();
     const terms=new Set(metadataWords(metadata).map(normalize).filter((term):term is string=>!!term));
     const score=wanted.length?wanted.filter(term=>terms.has(term)).length/wanted.length*100:null;
@@ -49,7 +50,14 @@ export function computeCrawlMetrics(input:CrawlMetricsInput={}) {
   const columns=lastPages.map(({terms:_terms,time:_time,index:_index,...page})=>page);
   const metadataMatch=analyzed.length&&wanted.length?analyzed.reduce((sum,page)=>sum+(page.metadataMatch||0),0)/analyzed.length:null;
   const matchHistory=wanted.length?analyzed.map(page=>({id:page.id,url:page.url,time:page.fetchedAt,score:page.metadataMatch!})):[];
+  const captureTimes=analyzed.map(page=>page.time).filter((at):at is number=>at!==null);
+  return {metadataWordCount,pagesAnalyzed:analyzed.length,metadataSample:{analyzed:analyzed.length,available:pages.length,limited:pages.length>limits.pages},
+    queryTerms:wanted,columns,termRows,metadataMatch,matchHistory,latestCaptureAt:captureTimes.length?Math.max(...captureTimes):null};
+}
 
+/** Pure and deterministic: the caller supplies the clock, replay-filtered arrays and optional memoized metadata. */
+export function computeCrawlMetrics(input:CrawlMetricsInput={},metadata=computeCrawlMetadata(input)) {
+  const frontier=input.frontier||[],events=input.events||[],edges=input.edges||[];
   const consideredEvents=events.slice(0,limits.events);
   // Completion marks every leftover queued URL "skipped", even if it was never attempted.
   // A skipped URL therefore needs its own failure or HTTP response evidence to count as checked.
@@ -84,14 +92,13 @@ export function computeCrawlMetrics(input:CrawlMetricsInput={}) {
     return status>=100&&status<=599&&Number.isFinite(durationMs)?[{id:event.id||`event-${index}`,url:event.url||null,time:event.time,status,durationMs,at,index}]:[];
   }).sort((a,b)=>a.at-b.at||a.index-b.index).slice(-24).map(({at:_at,index:_index,...sample})=>sample);
   const start=time(input.job?.createdAt),updated=time(input.job?.updatedAt);
-  const recordedTimes=[...analyzed.map(page=>page.time),...consideredEvents.map(event=>time(event.time))].filter((at):at is number=>at!==null);
+  const recordedTimes=[metadata.latestCaptureAt,...consideredEvents.map(event=>time(event.time))].filter((at):at is number=>at!==null);
   const end=input.replay?(recordedTimes.length?Math.max(...recordedTimes):start):input.job?.status==="running"?(time(input.now)??updated):(updated??time(input.now));
   const elapsedMs=start!==null&&end!==null?Math.max(0,end-start):null;
-  const metadataWordsPerMinute=elapsedMs!==null&&elapsedMs>0?metadataWordCount/(elapsedMs/60000):null;
+  const metadataWordsPerMinute=elapsedMs!==null&&elapsedMs>0?metadata.metadataWordCount/(elapsedMs/60000):null;
   const edgeCount=new Set(edges.slice(0,limits.edges).flatMap(edge=>{const source=address(edge.source),target=address(edge.target);return source&&target?[`${source.url}\n${target.url}`]:[];})).size;
-  return {elapsedMs,metadataWordCount,metadataWordsPerMinute,pagesAnalyzed:analyzed.length,totalDiscovered:byUrl.size,websiteCount:byHost.size,websites,
-    queryTerms:wanted,columns,termRows,metadataMatch,matchHistory,fetchSamples,
+  return {...metadata,elapsedMs,metadataWordsPerMinute,totalDiscovered:byUrl.size,websiteCount:byHost.size,websites,fetchSamples,
     averageFetchMs:fetchSamples.length?fetchSamples.reduce((sum,sample)=>sum+sample.durationMs,0)/fetchSamples.length:null,
     latestFetchMs:fetchSamples.at(-1)?.durationMs??null,edgeCount,
-    limited:pages.length>limits.pages||frontier.length>limits.frontier||events.length>limits.events||edges.length>limits.edges};
+    limited:metadata.metadataSample.limited||frontier.length>limits.frontier||events.length>limits.events||edges.length>limits.edges};
 }

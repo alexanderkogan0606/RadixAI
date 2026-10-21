@@ -1,4 +1,4 @@
-/** Research Atlas indexes public metadata. It never stores fetched HTML or acts as a proxy. */
+/** RadixAI indexes public metadata. It never stores fetched HTML or acts as a proxy. */
 import defaultCatalog from "./catalog.json" with { type:"json" };
 // @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
 import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl, sourceForUrl } from "./free-access.ts";
@@ -6,15 +6,17 @@ import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl, 
 import { assessResource, linkPriority, queryTerms } from "./resource-quality.ts";
 // @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
 import { AGENT_REVIEW_PREFIX, reviewCrawlCandidate, reviewCrawlFailure, type SupervisionReview } from "./crawl-supervision.ts";
+// @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
+import { CRAWL_LIMITS, CRAWL_PRESETS, DEFAULT_CRAWL_PRESET } from "./crawl-presets.ts";
 export interface CatalogSource {
   id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string; access?:string; exact?:boolean; title?:string; description?:string;
   provider?:string;query?:string;queryHistory?:string[];
 }
 type Row = Record<string, unknown>;
 type DB = D1Database;
-const BOT = "ResearchAtlasBot";
+const BOT = "RadixAIBot";
 const MAX_BYTES = 1_000_000;
-const MAX_QUEUE = 1500;
+const MAX_QUEUE = CRAWL_LIMITS.maxQueue;
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID();
 let eventSequence=0;
@@ -211,24 +213,26 @@ export async function readState(db:DB,user:string) {
     statement(db,"SELECT j.*, (SELECT count(*) FROM atlas_queue q WHERE q.job_id=j.id AND q.status IN ('queued','processing')) AS queued FROM atlas_jobs j WHERE user_id=? ORDER BY created_at DESC LIMIT 100",user),
     statement(db,"SELECT * FROM atlas_pages WHERE user_id=? ORDER BY fetched_at DESC LIMIT 2000",user),
     statement(db,"SELECT * FROM atlas_events WHERE user_id=? ORDER BY time DESC,id DESC LIMIT 500",user),
-    statement(db,"SELECT source,target,job_id AS jobId FROM atlas_edges WHERE user_id=? LIMIT 5000",user),
+    statement(db,"SELECT e.source,e.target,e.job_id AS jobId FROM atlas_edges e JOIN atlas_jobs j ON j.id=e.job_id AND j.user_id=e.user_id WHERE e.user_id=? ORDER BY CASE WHEN j.status='running' THEN 0 WHEN j.status='paused' THEN 1 ELSE 2 END,j.created_at DESC,e.id LIMIT 3000",user),
     statement(db,"SELECT * FROM atlas_sources WHERE user_id=? ORDER BY created_at DESC",user),
     statement(db,"SELECT resource_id FROM atlas_bookmarks WHERE user_id=?",user),
-    statement(db,"SELECT (SELECT COUNT(*) FROM atlas_pages WHERE user_id=?) AS pages,COUNT(*) AS jobs,COALESCE(SUM(processed),0) AS processed,COALESCE(SUM(indexed),0) AS indexed,COALESCE(SUM(errors),0) AS errors,(SELECT COUNT(*) FROM atlas_queue WHERE user_id=? AND status IN ('queued','processing')) AS queued,(SELECT COUNT(*) FROM atlas_queue WHERE user_id=?) AS frontier FROM atlas_jobs WHERE user_id=?",user,user,user,user),
+    statement(db,"SELECT (SELECT COUNT(*) FROM atlas_pages WHERE user_id=?) AS pages,COUNT(*) AS jobs,COALESCE(SUM(processed),0) AS processed,COALESCE(SUM(indexed),0) AS indexed,COALESCE(SUM(errors),0) AS errors,(SELECT COUNT(*) FROM atlas_queue WHERE user_id=? AND status IN ('queued','processing')) AS queued,(SELECT COUNT(*) FROM atlas_queue WHERE user_id=?) AS frontier,(SELECT COUNT(*) FROM atlas_edges WHERE user_id=?) AS edges FROM atlas_jobs WHERE user_id=?",user,user,user,user,user),
     statement(db,"SELECT p.* FROM atlas_pages p JOIN atlas_bookmarks b ON b.resource_id=p.id AND b.user_id=p.user_id WHERE p.user_id=? AND b.user_id=? ORDER BY p.fetched_at DESC",user,user),
-    statement(db,"WITH recent AS (SELECT id,status,created_at FROM atlas_jobs WHERE user_id=? ORDER BY CASE WHEN status='running' THEN 0 WHEN status='paused' THEN 1 ELSE 2 END,created_at DESC LIMIT 3) SELECT q.id,q.url,q.parent_url AS parentUrl,q.source_id AS sourceId,q.status,q.depth,q.job_id AS jobId,q.domain FROM atlas_queue q JOIN recent j ON j.id=q.job_id WHERE q.user_id=? ORDER BY CASE WHEN j.status='running' THEN 0 WHEN j.status='paused' THEN 1 ELSE 2 END,j.created_at DESC,q.depth,q.created_at DESC LIMIT 3000",user,user),
+    statement(db,"WITH recent AS (SELECT id,status,created_at FROM atlas_jobs WHERE user_id=? ORDER BY CASE WHEN status='running' THEN 0 WHEN status='paused' THEN 1 ELSE 2 END,created_at DESC LIMIT 3) SELECT q.id,q.url,q.parent_url AS parentUrl,q.source_id AS sourceId,q.status,q.depth,q.job_id AS jobId,q.domain FROM atlas_queue q JOIN recent j ON j.id=q.job_id WHERE q.user_id=? ORDER BY CASE WHEN j.status='running' THEN 0 WHEN j.status='paused' THEN 1 ELSE 2 END,j.created_at DESC,CASE WHEN q.status='processing' THEN 0 WHEN q.depth=0 THEN 1 ELSE 2 END,q.depth,q.created_at DESC LIMIT 2000",user,user),
   ]);
   const [jobRows,pageRows,eventRows,edgeRows,sourceRows,bookmarkRows,countRows,savedRows,frontierRows]=results.map(result=>result.results);
-  return {jobs:jobRows.map(publicJob),pages:pageRows.map(publicPage),events:eventRows.map(r=>({id:r.id,jobId:r.job_id,time:r.time,level:r.level,message:r.message,url:r.url})),edges:edgeRows,customSources:sourceRows.map(customSource),bookmarks:bookmarkRows.map(r=>r.resource_id),counts:countRows[0],savedPages:savedRows.map(publicPage),frontier:frontierRows};
+  const counts=countRows[0];
+  return {jobs:jobRows.map(publicJob),pages:pageRows.map(publicPage),events:eventRows.map(r=>({id:r.id,jobId:r.job_id,time:r.time,level:r.level,message:r.message,url:r.url})),edges:edgeRows,customSources:sourceRows.map(customSource),bookmarks:bookmarkRows.map(r=>r.resource_id),counts,savedPages:savedRows.map(publicPage),frontier:frontierRows,
+    truncated:{pages:Number(counts.pages)>pageRows.length,edges:Number(counts.edges)>edgeRows.length,frontier:Number(counts.frontier)>frontierRows.length}};
 }
 
 /** A selected historical run must not depend on the bounded cross-run dashboard snapshot. */
 export async function readRun(db:DB,user:string,id:string){
   const results=await db.batch<Row>([
     statement(db,"SELECT j.*, (SELECT COUNT(*) FROM atlas_queue q WHERE q.job_id=j.id AND q.status IN ('queued','processing')) AS queued FROM atlas_jobs j WHERE j.id=? AND j.user_id=?",id,user),
-    statement(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? ORDER BY depth,fetched_at,id LIMIT 300",user,id),
-    statement(db,"SELECT source,target,job_id AS jobId FROM atlas_edges WHERE user_id=? AND job_id=? ORDER BY source,target LIMIT 5000",user,id),
-    statement(db,"SELECT id,url,parent_url AS parentUrl,source_id AS sourceId,status,depth,job_id AS jobId,domain FROM atlas_queue WHERE user_id=? AND job_id=? ORDER BY depth,created_at,id LIMIT 1500",user,id),
+    statement(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? ORDER BY depth,fetched_at,id LIMIT 2000",user,id),
+    statement(db,"SELECT source,target,job_id AS jobId FROM atlas_edges WHERE user_id=? AND job_id=? ORDER BY source,target LIMIT 3000",user,id),
+    statement(db,"SELECT id,url,parent_url AS parentUrl,source_id AS sourceId,status,depth,job_id AS jobId,domain FROM atlas_queue WHERE user_id=? AND job_id=? ORDER BY CASE WHEN status='processing' THEN 0 WHEN depth=0 THEN 1 ELSE 2 END,depth,created_at,id LIMIT 2000",user,id),
     statement(db,"SELECT id,job_id AS jobId,time,level,message,url FROM atlas_events WHERE user_id=? AND job_id=? ORDER BY time DESC,id DESC LIMIT 500",user,id),
     statement(db,"SELECT (SELECT COUNT(*) FROM atlas_pages WHERE user_id=? AND job_id=?) AS pages,(SELECT COUNT(*) FROM atlas_edges WHERE user_id=? AND job_id=?) AS edges,(SELECT COUNT(*) FROM atlas_queue WHERE user_id=? AND job_id=?) AS frontier,(SELECT COUNT(*) FROM atlas_events WHERE user_id=? AND job_id=?) AS events",user,id,user,id,user,id,user,id),
   ]);
@@ -283,14 +287,16 @@ export async function* exportDataChunks(db:DB,user:string,kind:string,catalog:Ca
 
 export async function createJob(db:DB,user:string,input:Row,catalog:CatalogSource[]) {
   const query = typeof input.query === "string" ? input.query.trim().slice(0,300) : "";
-  const maxPages = Number(input.maxPages ?? 30), maxDepth = Number(input.maxDepth ?? 1);
-  if (!Number.isInteger(maxPages) || maxPages < 5 || maxPages > 300) throw new ApiError("Page limit must be between 5 and 300.");
-  if (!Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > 3) throw new ApiError("Crawl depth must be between 0 and 3.");
-  const scope = input.scope ?? "same-domain";
+  const preset=input.preset===undefined?DEFAULT_CRAWL_PRESET:CRAWL_PRESETS.find(preset=>preset.id===input.preset);
+  if(!preset)throw new ApiError("Choose Focused, Deep, or Extensive crawl settings.");
+  const maxPages = Number(input.maxPages ?? preset.maxPages), maxDepth = Number(input.maxDepth ?? preset.maxDepth);
+  if (!Number.isInteger(maxPages) || maxPages < CRAWL_LIMITS.minPages || maxPages > CRAWL_LIMITS.maxPages) throw new ApiError(`Page limit must be between ${CRAWL_LIMITS.minPages} and ${CRAWL_LIMITS.maxPages}.`);
+  if (!Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > CRAWL_LIMITS.maxDepth) throw new ApiError(`Crawl depth must be between 0 and ${CRAWL_LIMITS.maxDepth}.`);
+  const scope = input.scope ?? preset.scope;
   if (scope !== "same-domain" && scope !== "linked-domains") throw new ApiError("Choose a valid crawl scope.");
   const ids = Array.isArray(input.sourceIds) ? [...new Set(input.sourceIds.map(String))] : [];
   const urls = Array.isArray(input.urls) ? [...new Set(input.urls.map(v=>safeUrl(v)))] : [];
-  if (ids.length + urls.length > 30) throw new ApiError("Choose up to 30 starting sources or URLs per crawl.");
+  if (ids.length + urls.length > CRAWL_LIMITS.maxSeeds) throw new ApiError(`Choose up to ${CRAWL_LIMITS.maxSeeds} starting sources or URLs per crawl.`);
   const custom = await all(db,"SELECT * FROM atlas_sources WHERE user_id=?",user);
   const catalogIds=new Set(catalog.map(source=>source.id));
   const accessCatalog=[...catalog,...defaultCatalog];

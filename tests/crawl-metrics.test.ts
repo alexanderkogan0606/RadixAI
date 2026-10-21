@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 // @ts-expect-error Node's native TypeScript tests require the explicit extension.
-import {computeCrawlMetrics,type CrawlMetricPage} from "../lib/crawl-metrics.ts";
+import {computeCrawlMetadata,computeCrawlMetrics,type CrawlMetricPage} from "../lib/crawl-metrics.ts";
 
 const start="2026-10-21T12:00:00.000Z";
 const at=(seconds:number)=>new Date(Date.parse(start)+seconds*1000).toISOString();
@@ -126,8 +126,21 @@ test("Fetch charts include only recorded HTTP duration events, ordered and cappe
 });
 
 test("Large input is bounded explicitly and discovered links are counted without duplicates",()=>{
-  const metrics=computeCrawlMetrics({pages:Array.from({length:305},(_,i)=>page(String(i),"Bank","Lending",i)),
+  const metrics=computeCrawlMetrics({pages:Array.from({length:1005},(_,i)=>page(String(i),"Bank","Lending",i)).reverse(),query:"Bank",
     frontier:Array.from({length:5001},(_,i)=>({url:`https://research.org/${i}`,status:"queued"})),
     edges:[{source:"https://research.org/a",target:"https://research.org/b"},{source:"https://research.org/a",target:"https://research.org/b#part"},{source:"invalid",target:"https://research.org/b"}]});
-  assert.equal(metrics.pagesAnalyzed,300);assert.equal(metrics.totalDiscovered,5000);assert.equal(metrics.edgeCount,1);assert.equal(metrics.limited,true);
+  assert.equal(metrics.pagesAnalyzed,1000);assert.equal(metrics.totalDiscovered,5000);assert.equal(metrics.edgeCount,1);assert.equal(metrics.limited,true);
+  assert.deepEqual(metrics.metadataSample,{analyzed:1000,available:1005,limited:true});
+  assert.equal(metrics.matchHistory[0].id,"5");assert.equal(metrics.matchHistory.at(-1)?.id,"1004","The most recent metadata is sampled independently of response order.");
+});
+
+test("Operational telemetry reuses memoized metadata without reading page text again",()=>{
+  const pages=[page("first","AI banking","Artificial intelligence improves banking.",30)],metadata=computeCrawlMetadata({pages,query:"AI banking"});
+  const input={pages,query:"AI banking",job:{status:"running",createdAt:start,updatedAt:at(40)},now:Date.parse(at(60))};
+  assert.deepEqual(computeCrawlMetrics(input,metadata),computeCrawlMetrics(input));
+  const guardedPages=new Proxy(pages,{get(){throw new Error("Operational polling must not analyze page text.");}});
+  const updated=computeCrawlMetrics({...input,pages:guardedPages,now:Date.parse(at(120)),events:[{time:at(100),message:"HTTP 200 · 42 ms · Indexed metadata"}]},metadata);
+  assert.equal(updated.elapsedMs,120000);assert.equal(updated.latestFetchMs,42);
+  assert.equal(updated.termRows,metadata.termRows);assert.equal(updated.matchHistory,metadata.matchHistory);assert.equal(updated.columns,metadata.columns);
+  assert.equal(updated.metadataWordsPerMinute,metadata.metadataWordCount/2);
 });

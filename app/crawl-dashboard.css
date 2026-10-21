@@ -1,0 +1,10 @@
+.crawl-run-overview{display:grid;grid-template-columns:minmax(220px,1fr) minmax(480px,1.35fr);gap:16px 30px;padding:18px 20px;background:#161c18;border:1px solid #303c34;border-radius:6px;margin:14px 0 10px}
+.crawl-run-overview>.eyebrow,.crawl-run-overview .eyebrow{font-size:10px;color:#8fc4a5}
+.crawl-run-overview p{font-size:11px;color:#a5b8ac;line-height:1.65;margin:7px 0 0}
+.crawl-run-overview dl{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;align-items:center;margin:0}
+.crawl-run-overview dt{font-size:10px;color:#95a69b;margin-bottom:8px}
+.crawl-run-overview dd{margin:0;color:#e0eee5;font:20px var(--mono)}
+.crawl-run-overview dd small{font:10px var(--mono);color:#819c8c;white-space:nowrap}
+.crawl-run-overview .crawl-sample-note{grid-column:1/-1;margin:0;border-top:1px solid #2f3b33;padding-top:10px;font-size:10px;color:#8ca698}
+@media(max-width:1050px){.crawl-run-overview{grid-template-columns:1fr}}
+@media(max-width:560px){.crawl-run-overview{padding:14px}.crawl-run-overview dl{grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.crawl-run-overview dd{font-size:18px}}

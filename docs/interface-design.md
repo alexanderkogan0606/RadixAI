@@ -1,6 +1,6 @@
 # Interface design
 
-Signal's crawler is the primary workspace: a large, actual URL-link graph with a small run toolbar and activity strip. The original reference is [Zivlen's crawler animation](https://x.com/zivlen_coder/status/2111063806248157386). Its branching network and dense operating view inform the composition; all rendered research links come from real crawl discoveries.
+RadixAI's crawler is the primary workspace: a large, actual URL-link graph with a small run toolbar and activity strip. The original reference is [Zivlen's crawler animation](https://x.com/zivlen_coder/status/2111063806248157386). Its branching network and dense operating view inform the composition; all rendered research links come from real crawl discoveries.
 
 ## Guidance reviewed and applied
 
@@ -63,7 +63,13 @@ Applied the current Anthropic frontend-design skill and Vercel web-interface gui
 
 The live search uses the free OpenAlex, Crossref, World Bank, and SEC EDGAR APIs. Company-report questions return individual SEC filings with the actual company, form, reporting period, and document path. Provider failures are explicit. Discovery metadata is distinguished from fetched page metadata; no full-document synthesis is implied. Saved records are durable, exact open-access URLs retain their evidence, and old session/login/navigation captures are excluded from normal Results while the archive is preserved.
 
-Hosted verification exposed OpenAlex shared-IP rate limits. Crossref is a conditional fallback with a currently effective Creative Commons license and a public document response check. Its [public API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/access-and-authentication/) needs no paid account; [reuse licensing is not by itself evidence of free access](https://www.crossref.org/documentation/retrieve-metadata/text-and-data-mining/), so access gates and unusable document responses are excluded. Loading states follow the actual request, previous search documents disappear while a new question runs, and a failed or empty search gives a specific explanation.
+Hosted verification exposed OpenAlex shared-IP rate limits. Topic searches now query OpenAIRE, Crossref, World Bank, and OpenAlex together. Crossref requires a currently effective Creative Commons license and a public document response check. Its [public API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/access-and-authentication/) needs no paid account; [reuse licensing is not by itself evidence of free access](https://www.crossref.org/documentation/retrieve-metadata/text-and-data-mining/), so access gates and unusable document responses are excluded. OpenAIRE requires explicit access evidence for the selected copy. Loading states follow the actual request, previous search documents disappear while a new question runs, and a failed or empty search gives a specific explanation.
+
+Search feedback leads with the result: documents added and the collection available. Individual provider failures sit in expandable Search coverage, so an OpenAlex cooldown does not tell the user to retry a completed search. “Find more documents” continues the original question with server-owned pagination; it preserves the existing collection while pending, adds new records first, and survives reloads. Counts distinguish new documents, the cumulative collection, and provider records examined in the last batch. Only 24 collected document rows render initially, with an explicit control to reveal more. A zero-result batch is never described as exhaustive coverage.
+
+RadixAI's Extensive mode sequences up to 20 saved research batches with a visible stop control; Deep runs six and Quick runs one. The 3D web uses real x/y/z layout, perspective projection, depth-sorted nodes, and an orbit camera. Drag rotates; Shift/right-drag pans, and dedicated touch controls expose the same modes. Existing spring motion, worker layout, bounded drawing, and reduced-motion behavior remain. The crawler follows real request destinations in the projected network.
+
+Every crawl has a run overview with exact operational totals and the recorded reason it stopped. The six colored panels use plain labels: Crawl log, Websites, Topic coverage, Word heat, Query match, and Live review. Larger snapshots carry sampling notices. Metadata analysis is cached separately from operational polling so new events do not repeatedly analyze 1,000 page summaries.
 
 ### Uiverse components
 

@@ -3,16 +3,17 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import {classifyPageAccess} from '../lib/free-access';
 import GraphLayoutWorker from './graph-layout.worker?worker';
 import { GraphMotion, hashPhase, stepSpring, type Spring } from './graph-motion';
+import { projectPoint, rotateOrbit, type Point3, type Orbit } from './graph-projection';
 
 export const colors:Record<string,string>={Finance:'#d6d6d6',Business:'#b5b5b5',Technology:'#9c9c9c','Case studies':'#c6c6c6'};
 export type Source={id:string;sourceId?:string;name:string;url:string;domain:string;category:string;type:string;access:string;description:string;tags:string[];geography:string;crawlMethod:string;feedUrl?:string;verification:string;provenanceUrl?:string;checkedAt?:string};
 export type CrawlFrontier={id?:string;url:string;parentUrl?:string|null;sourceId?:string;status?:string;depth?:number;jobId?:string};
 type PageRecord=CrawlFrontier&{title?:string;name?:string;description?:string;domain?:string;category?:string;tags?:string[];fetchedAt?:string};
 type CrawlEdge={source:string;target:string;jobId?:string};
-type Node={key:string;id:string;label:string;url:string;x:number;y:number;depth:number;root:boolean;status:string;resource:Source};
+type Node={key:string;id:string;label:string;url:string;x:number;y:number;z:number;depth:number;root:boolean;status:string;resource:Source};
 type Line={source:string;target:string;tree:boolean};
-type Scene={nodes:Node[];lines:Line[];bounds:{left:number;right:number;top:number;bottom:number}};
-type Position={key:string;x:number;y:number};
+type Scene={nodes:Node[];lines:Line[];bounds:{left:number;right:number;top:number;bottom:number;back:number;front:number;radius:number}};
+type Position=Point3&{key:string};
 type Props={sources:Source[];pages:PageRecord[];edges:CrawlEdge[];select:(s:Source)=>void;selected:string;zoom:number;setZoom:(z:number)=>void;layoutKey:number;frontier?:CrawlFrontier[];seedUrls?:string[];active?:boolean;crawlerUrl?:string;layoutPages?:PageRecord[];layoutEdges?:CrawlEdge[];layoutFrontier?:CrawlFrontier[]};
 const EMPTY_FRONTIER:CrawlFrontier[]=[];
 const EMPTY_SEEDS:string[]=[];
@@ -20,10 +21,10 @@ const MONO='10px ui-monospace, SFMono-Regular, Menlo, monospace';
 function keyOf(url:string){try{const u=new URL(url);u.hash='';return u.href}catch{return url}}
 function shortUrl(url:string){try{const u=new URL(url);return u.hostname.replace(/^www\./,'')+(u.pathname==='/'?'':u.pathname)}catch{return url}}
 function random(key:string){let hash=2166136261;for(let i=0;i<key.length;i++)hash=Math.imul(hash^key.charCodeAt(i),16777619);return (hash>>>0)/4294967295}
-function positionScene(scene:Scene,positions:Map<string,{x:number;y:number}>):Scene{
-  let left=-70,right=70,top=-70,bottom=70;
-  const nodes=scene.nodes.map(node=>{const point=positions.get(node.key),next=point?{...node,x:point.x,y:point.y}:node;left=Math.min(left,next.x);right=Math.max(right,next.x);top=Math.min(top,next.y);bottom=Math.max(bottom,next.y);return next});
-  return {...scene,nodes,bounds:{left,right,top,bottom}};
+function positionScene(scene:Scene,positions:Map<string,Point3>):Scene{
+  let left=-70,right=70,top=-70,bottom=70,back=-70,front=70;
+  const nodes=scene.nodes.map(node=>{const point=positions.get(node.key),next=point?{...node,x:point.x,y:point.y,z:point.z}:node;left=Math.min(left,next.x);right=Math.max(right,next.x);top=Math.min(top,next.y);bottom=Math.max(bottom,next.y);back=Math.min(back,next.z);front=Math.max(front,next.z);return next});
+  return {...scene,nodes,bounds:{left,right,top,bottom,back,front,radius:Math.max(95,...nodes.map(node=>Math.hypot(node.x-(left+right)/2,node.y-(top+bottom)/2,node.z-(back+front)/2)))}};
 }
 
 /** A deterministic branching layout of real discoveries, with irregular lengths and local fans. */
@@ -40,7 +41,7 @@ function buildScene(sources:Source[],pages:PageRecord[],edges:CrawlEdge[],fronti
     const id=record?.id||existing?.id||`discovered:${key}`;
     const status=indexed?'indexed':record?.status||existing?.status||'discovered';
     const resource:Source={...(record?.jobId?{jobId:record.jobId}:{}),id,sourceId:record?.sourceId||source?.id,name:title,url,domain:record?.domain||source?.domain||'Research',category:record?.category||source?.category||'Crawled links',type:indexed?'Indexed page':'Discovered URL',access:classifyPageAccess({url},sources),description:record?.description||(indexed?'Metadata captured from this page.':'URL discovered by the crawler; page content has not been indexed.'),tags:record?.tags||[],geography:source?.geography||'Global',crawlMethod:source?.crawlMethod||'Manual',verification:indexed?'Crawled':status==='processing'?'Fetching':status==='blocked'?'Blocked':'Discovered'};
-    const node:Node={key,id,label:title,url,x:0,y:0,depth:0,root:false,status,resource};
+    const node:Node={key,id,label:title,url,x:0,y:0,z:0,depth:0,root:false,status,resource};
     nodes.set(key,node);if(record?.depth===0&&!record.parentUrl)suggestedRoots.add(key);
     return node;
   }
@@ -87,16 +88,16 @@ function buildScene(sources:Source[],pages:PageRecord[],edges:CrawlEdge[],fronti
       const parent=nodes.get(p.parent)!,branchWeight=weights.get(p.key)||1;
       const length=(node.depth===1?90:45)+random(p.key)*95+Math.min(100,Math.sqrt(branchWeight)*12);
       const angle=mid+(random(p.key+'angle')-.5)*Math.min(.34,(p.end-p.start)*.4);
-      node.x=parent.x+Math.cos(angle)*length;node.y=parent.y+Math.sin(angle)*length;
+      node.x=parent.x+Math.cos(angle)*length;node.y=parent.y+Math.sin(angle)*length;node.z=parent.z+(random(p.key+'depth')-.5)*length*1.4;
     }else if(roots.length>1){
-      const radius=110+Math.sqrt(roots.length)*40+random(p.key)*80;node.x=Math.cos(mid)*radius;node.y=Math.sin(mid)*radius;
+      const radius=110+Math.sqrt(roots.length)*40+random(p.key)*80;node.x=Math.cos(mid)*radius;node.y=Math.sin(mid)*radius;node.z=(random(p.key+'depth')-.5)*radius;
     }
     let angle=p.start;
     for(const child of tree.get(p.key)||[]){const span=(p.end-p.start)*(weights.get(child)||1)/(weights.get(p.key)||1);placements.push({key:child,start:angle,end:angle+span,parent:p.key});angle+=span}
   }
-  const list=[...nodes.values()];let left=-70,right=70,top=-70,bottom=70;
-  for(const n of list){left=Math.min(left,n.x);right=Math.max(right,n.x);top=Math.min(top,n.y);bottom=Math.max(bottom,n.y)}
-  return {nodes:list,lines:[...links.values()],bounds:{left,right,top,bottom}};
+  const list=[...nodes.values()];let left=-70,right=70,top=-70,bottom=70,back=-70,front=70;
+  for(const n of list){left=Math.min(left,n.x);right=Math.max(right,n.x);top=Math.min(top,n.y);bottom=Math.max(bottom,n.y);back=Math.min(back,n.z);front=Math.max(front,n.z)}
+  return {nodes:list,lines:[...links.values()],bounds:{left,right,top,bottom,back,front,radius:Math.max(95,...list.map(node=>Math.hypot(node.x-(left+right)/2,node.y-(top+bottom)/2,node.z-(back+front)/2)))}};
 }
 
 function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,frontier=EMPTY_FRONTIER,seedUrls=EMPTY_SEEDS,active=false,crawlerUrl='',layoutPages,layoutEdges,layoutFrontier}:Props){
@@ -108,12 +109,14 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
   const visibleSceneRef=useRef(scene),sceneRef=useRef(scene),layoutSceneRef=useRef(layoutScene);
   const zoomRef=useRef(zoom),selectedRef=useRef(selected),hoverRef=useRef(''),onZoomRef=useRef(setZoom),activeRef=useRef(active);
   const crawlerRef=useRef(crawlerUrl);
+  const orbit=useRef<Orbit>({yaw:.48,pitch:-.23}),interactionMode=useRef<'rotate'|'pan'>('rotate');
+  const [mode,setMode]=useState<'rotate'|'pan'>('rotate');
   const offset=useRef({x:0,y:0}),size=useRef({width:900,height:500});
-  const drag=useRef<{x:number;y:number;startX:number;startY:number;moved:boolean}|null>(null);
-  const rendered=useRef<{node:Node;x:number;y:number}[]>([]),schedule=useRef<()=>void>(()=>{});
+  const drag=useRef<{x:number;y:number;startX:number;startY:number;moved:boolean;pan:boolean}|null>(null);
+  const rendered=useRef<{node:Node;x:number;y:number;perspective:number;depth:number;alpha:number}[]>([]),schedule=useRef<()=>void>(()=>{});
   const motion=useRef(new GraphMotion()),edgeBirths=useRef(new Map<string,number>());
-  const positionsRef=useRef(new Map<string,{x:number;y:number}>()),topologyRef=useRef(''),settledTopologyRef=useRef('');
-  const settledPositionsRef=useRef(new Map<string,{x:number;y:number}>());
+  const positionsRef=useRef(new Map<string,Point3>()),topologyRef=useRef(''),settledTopologyRef=useRef('');
+  const settledPositionsRef=useRef(new Map<string,Point3>());
   const workerRef=useRef<{worker:Worker;timeout:ReturnType<typeof setTimeout>}|null>(null);
   const retarget=useRef<()=>void>(()=>{});
   const [hover,setHover]=useState<{label:string;url:string;status:string}|null>(null);
@@ -132,7 +135,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
     for(const node of layoutScene.nodes)if(!positions.has(node.key)){
       const parent=positions.get(parents.get(node.key)||'');
       const angle=random(node.key)*Math.PI*2,length=35+random(node.key+'distance')*45;
-      positions.set(node.key,parent?{x:parent.x+Math.cos(angle)*length,y:parent.y+Math.sin(angle)*length}:{x:node.x,y:node.y});
+      positions.set(node.key,parent?{x:parent.x+Math.cos(angle)*length,y:parent.y+Math.sin(angle)*length,z:parent.z+(random(node.key+'z')-.5)*length}:{x:node.x,y:node.y,z:node.z});
     }
     positionsRef.current=positions;layoutSceneRef.current=positionScene(layoutScene,positions);retarget.current();
     const topology=layoutScene.nodes.map(node=>node.key).sort().join('\n')+'\0'+layoutScene.lines.map(line=>line.source+'\t'+line.target).sort().join('\n');
@@ -148,8 +151,8 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
       workerRef.current={worker,timeout};if(canvas){canvas.dataset.layoutState='relaxing';delete canvas.dataset.layoutError}
       worker.onmessage=(event:MessageEvent<{positions:Position[];iterations:number;durationMs:number}>)=>{
         if(workerRef.current?.worker!==worker)return;
-        const coordinates=new Map<string,{x:number;y:number}>();
-        for(const point of event.data.positions)if(Number.isFinite(point.x)&&Number.isFinite(point.y)&&Math.abs(point.x)<1e6&&Math.abs(point.y)<1e6)coordinates.set(point.key,{x:point.x,y:point.y});
+        const coordinates=new Map<string,Point3>();
+        for(const point of event.data.positions)if(Number.isFinite(point.x)&&Number.isFinite(point.y)&&Number.isFinite(point.z)&&Math.abs(point.x)<1e6&&Math.abs(point.y)<1e6&&Math.abs(point.z)<1e6)coordinates.set(point.key,{x:point.x,y:point.y,z:point.z});
         // Retain complete run positions when only a replay subset is visible.
         for(const [key,point] of coordinates){positionsRef.current.set(key,point);settledPositionsRef.current.set(key,point)}
         settledTopologyRef.current=topology;layoutSceneRef.current=positionScene(layoutSceneRef.current,positionsRef.current);
@@ -157,7 +160,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
         stop();retarget.current();
       };
       worker.onerror=(event)=>{if(workerRef.current?.worker!==worker)return;if(canvas){canvas.dataset.layoutState='fallback-error';canvas.dataset.layoutError=event.message||'Worker script failed to load or execute.'}stop()};
-      worker.postMessage({nodes:layoutSceneRef.current.nodes.map(node=>({key:node.key,x:node.x,y:node.y,root:node.root,settled:previous.has(node.key)})),edges:layoutScene.lines,warmStart:previous.size>layoutScene.nodes.length*.6});
+      worker.postMessage({nodes:layoutSceneRef.current.nodes.map(node=>({key:node.key,x:node.x,y:node.y,z:node.z,root:node.root,settled:previous.has(node.key)})),edges:layoutScene.lines,warmStart:previous.size>layoutScene.nodes.length*.6});
     }catch(error){if(canvas){canvas.dataset.layoutState='fallback-error';canvas.dataset.layoutError=error instanceof Error?error.message:String(error)}}
   },[layoutScene]);
   useEffect(()=>()=>{if(workerRef.current){workerRef.current.worker.terminate();clearTimeout(workerRef.current.timeout);workerRef.current=null}},[]);
@@ -166,13 +169,13 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
   useEffect(()=>{activeRef.current=active;schedule.current()},[active]);
   useEffect(()=>{crawlerRef.current=crawlerUrl;schedule.current()},[crawlerUrl]);
   useEffect(()=>{onZoomRef.current=setZoom},[setZoom]);
-  useEffect(()=>{offset.current={x:0,y:0};schedule.current()},[layoutKey]);
+  useEffect(()=>{offset.current={x:0,y:0};orbit.current={yaw:.48,pitch:-.23};schedule.current()},[layoutKey]);
   useEffect(()=>{
     const canvas=canvasRef.current;if(!canvas)return;const ctx=canvas.getContext('2d');if(!ctx)return;
     const preference=window.matchMedia('(prefers-reduced-motion: reduce)');
     let frame:number|null=null,disposed=false,renderCount=0,lastTime=0,flowTime=0;
     let reducedMotion=preference.matches,onScreen=true,cameraReady=false,focusReady=false,crawlerReady=false;
-    const camera={x:{value:0,velocity:0},y:{value:0,velocity:0},scale:{value:1,velocity:0}},activity:Spring={value:0,velocity:0};
+    const camera={x:{value:0,velocity:0},y:{value:0,velocity:0},z:{value:0,velocity:0},scale:{value:1,velocity:0}},activity:Spring={value:0,velocity:0};
     const focusPosition={x:{value:0,velocity:0},y:{value:0,velocity:0}};
     const crawlerPosition={x:{value:0,velocity:0},y:{value:0,velocity:0}};
     const trail:{x:number;y:number}[]=[];
@@ -182,18 +185,22 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
       const started=performance.now(),seconds=lastTime?Math.min(.1,(now-lastTime)/1000):1/60;lastTime=now;
       const {width:w,height:h}=size.current,{nodes,lines}=sceneRef.current,bounds=layoutSceneRef.current.bounds;
       let moving=motion.current.advance(seconds,now,reducedMotion);
-      const fit=Math.max(.03,Math.min((w-100)/Math.max(140,bounds.right-bounds.left),(h-120)/Math.max(140,bounds.bottom-bounds.top),1.6));
+      const radius=bounds.radius;
+      const fit=Math.max(.015,Math.min((w-90)/(radius*2.35),(h-100)/(radius*2.35),1.6));
       moving=stepSpring(camera.x,(bounds.left+bounds.right)/2,seconds,reducedMotion||!cameraReady)||moving;
       moving=stepSpring(camera.y,(bounds.top+bounds.bottom)/2,seconds,reducedMotion||!cameraReady)||moving;
+      moving=stepSpring(camera.z,(bounds.back+bounds.front)/2,seconds,reducedMotion||!cameraReady)||moving;
       moving=stepSpring(camera.scale,fit,seconds,reducedMotion||!cameraReady,.00002)||moving;cameraReady=true;
       moving=stepSpring(activity,activeRef.current&&!reducedMotion?1:0,seconds,reducedMotion,.001)||moving;
       flowTime+=seconds*activity.value;
-      const scale=camera.scale.value*zoomRef.current,points=new Map<string,{node:Node;x:number;y:number;alpha:number}>();
+      const scale=camera.scale.value*zoomRef.current,points=new Map<string,{node:Node;x:number;y:number;alpha:number;depth:number;perspective:number}>();
       for(const node of nodes){
         const point=motion.current.points.get(node.key);if(!point)continue;
-        points.set(node.key,{node,x:w/2+offset.current.x+(point.x.value-camera.x.value)*scale,y:h/2+offset.current.y+(point.y.value-camera.y.value)*scale,alpha:point.alpha});
+        const projected=projectPoint({x:point.x.value-camera.x.value,y:point.y.value-camera.y.value,z:point.z.value-camera.z.value},orbit.current,radius*4.5);
+        points.set(node.key,{node,x:w/2+offset.current.x+projected.x*scale,y:h/2+offset.current.y+projected.y*scale,alpha:point.alpha,depth:projected.depth,perspective:projected.perspective});
       }
-      rendered.current=[...points.values()].filter(p=>p.alpha>.15&&p.x>-20&&p.x<w+20&&p.y>-20&&p.y<h+20);
+      rendered.current=[...points.values()].filter(p=>p.alpha>.15&&p.x>-20&&p.x<w+20&&p.y>-20&&p.y<h+20).sort((a,b)=>b.depth-a.depth);
+      canvas!.dataset.viewMode='3d';canvas!.dataset.orbit=`${orbit.current.yaw.toFixed(3)},${orbit.current.pitch.toFixed(3)}`;
       const agentPoint=points.get(keyOf(crawlerRef.current));
       const focus=nodes.find(n=>n.id===selectedRef.current||n.key===selectedRef.current||n.url===selectedRef.current)?.key||hoverRef.current||agentPoint?.node.key||'';
       const connected=new Set<string>(),rootCount=nodes.reduce((n,node)=>n+Number(node.root),0);
@@ -229,8 +236,8 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
       }
       for(const p of rendered.current){
         const node=p.node,focused=node.key===focus,near=connected.has(node.key),indexed=node.status==='indexed';
-        const failed=['blocked','error','skipped'].includes(node.status),radius=node.root?3.3:focused?3:indexed?1.9:1.15;
-        ctx!.globalAlpha=points.get(node.key)!.alpha;
+        const failed=['blocked','error','skipped'].includes(node.status),radius=(node.root?3.6:focused?3.3:indexed?2.1:1.3)*p.perspective;
+        ctx!.globalAlpha=p.alpha*Math.max(.35,Math.min(1,p.perspective*.8));
         if(focused){const halo=ctx!.createRadialGradient(p.x,p.y,1,p.x,p.y,26);halo.addColorStop(0,'rgba(155,221,208,.20)');halo.addColorStop(1,'rgba(155,221,208,0)');ctx!.fillStyle=halo;ctx!.fillRect(p.x-26,p.y-26,52,52)}
         ctx!.beginPath();ctx!.arc(p.x,p.y,radius,0,Math.PI*2);
         ctx!.fillStyle=focused?'#c3f2e8':node.root?'#f0f0f0':near?'#d1d1d1':indexed?'#b1b1b1':'#747474';
@@ -309,24 +316,29 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
   },[]);
   function hit(clientX:number,clientY:number){
     const rect=canvasRef.current!.getBoundingClientRect(),x=clientX-rect.left,y=clientY-rect.top;
-    let closest:Node|undefined,distance=9;
-    for(const point of rendered.current){const d=Math.hypot(point.x-x,point.y-y);if(d<distance){closest=point.node;distance=d}}
+    let closest:Node|undefined,distance=10;
+    for(const point of rendered.current){const d=Math.hypot(point.x-x,point.y-y)/Math.max(.85,point.perspective);if(d<=distance){closest=point.node;distance=d}}
     return closest;
   }
   function clearHover(){if(hoverRef.current){hoverRef.current='';setHover(null);schedule.current()}}
-  function fit(){offset.current={x:0,y:0};zoomRef.current=1;setZoom(1);schedule.current()}
+  function fit(){offset.current={x:0,y:0};orbit.current={yaw:.48,pitch:-.23};zoomRef.current=1;setZoom(1);schedule.current()}
   return <div className="graph-canvas" style={{background:'#121212'}}>
-    <canvas ref={canvasRef} tabIndex={0} aria-label={`Crawl spider: ${scene.nodes.length} discovered URLs and ${scene.lines.length} real hyperlinks. Drag to pan, scroll to zoom, press F to fit.`} style={{backgroundImage:'radial-gradient(#272727 .65px,transparent .65px)',backgroundSize:'24px 24px',touchAction:'none'}}
-      onPointerDown={e=>{if(e.button!==0)return;drag.current={x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY,moved:false};e.currentTarget.setPointerCapture(e.pointerId);e.currentTarget.style.cursor='grabbing';clearHover()}}
+    <canvas ref={canvasRef} tabIndex={0} aria-label={`3D crawl network: ${scene.nodes.length} discovered URLs and ${scene.lines.length} real hyperlinks. Drag to rotate, Shift-drag to pan, scroll to zoom. Arrow keys rotate; Shift and arrows pan. Press F to reset.`} style={{backgroundImage:'radial-gradient(ellipse at center,#1b252020,transparent 70%)',touchAction:'none'}}
+      onContextMenu={e=>e.preventDefault()}
+      onPointerDown={e=>{if(e.button!==0&&e.button!==2)return;drag.current={x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY,moved:false,pan:e.shiftKey||e.button===2||interactionMode.current==='pan'};e.currentTarget.setPointerCapture(e.pointerId);e.currentTarget.style.cursor='grabbing';clearHover()}}
       onPointerMove={e=>{
-        if(drag.current){const d=drag.current;offset.current.x+=e.clientX-d.x;offset.current.y+=e.clientY-d.y;d.moved ||= Math.hypot(e.clientX-d.startX,e.clientY-d.startY)>3;d.x=e.clientX;d.y=e.clientY;schedule.current();return}
+        if(drag.current){const d=drag.current;if(d.pan){offset.current.x+=e.clientX-d.x;offset.current.y+=e.clientY-d.y}else{orbit.current=rotateOrbit(orbit.current,e.clientX-d.x,e.clientY-d.y)}d.moved ||= Math.hypot(e.clientX-d.startX,e.clientY-d.startY)>3;d.x=e.clientX;d.y=e.clientY;schedule.current();return}
         const node=hit(e.clientX,e.clientY),key=node?.key||'';e.currentTarget.style.cursor=node?'pointer':'grab';
         if(key!==hoverRef.current){hoverRef.current=key;setHover(node?{label:node.label,url:node.url,status:node.status}:null);schedule.current()}
       }}
-      onPointerUp={e=>{if(drag.current&&!drag.current.moved){const node=hit(e.clientX,e.clientY);if(node)select(node.resource)}drag.current=null;e.currentTarget.style.cursor='grab';if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId)}}
+      onPointerUp={e=>{if(e.button===0&&drag.current&&!drag.current.moved){const node=hit(e.clientX,e.clientY);if(node)select(node.resource)}drag.current=null;e.currentTarget.style.cursor='grab';if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId)}}
       onPointerCancel={()=>{drag.current=null;clearHover()}} onPointerLeave={()=>{if(!drag.current)clearHover()}}
       onDoubleClick={fit}
-      onKeyDown={e=>{if(e.key.toLowerCase()==='f'||e.key==='0'){e.preventDefault();fit()}else if(['+','=','-'].includes(e.key)){e.preventDefault();setZoom(Math.max(.45,Math.min(2.7,zoomRef.current*(e.key==='-'?.85:1.15))))}else if(e.key.startsWith('Arrow')){e.preventDefault();offset.current.x+=e.key==='ArrowLeft'?30:e.key==='ArrowRight'?-30:0;offset.current.y+=e.key==='ArrowUp'?30:e.key==='ArrowDown'?-30:0;schedule.current()}}}/>
+      onKeyDown={e=>{if(e.key.toLowerCase()==='f'||e.key==='0'){e.preventDefault();fit()}else if(['+','=','-'].includes(e.key)){e.preventDefault();setZoom(Math.max(.45,Math.min(2.7,zoomRef.current*(e.key==='-'?.85:1.15))))}else if(e.key.startsWith('Arrow')){e.preventDefault();const dx=e.key==='ArrowLeft'?-30:e.key==='ArrowRight'?30:0,dy=e.key==='ArrowUp'?-30:e.key==='ArrowDown'?30:0;if(e.shiftKey){offset.current.x-=dx;offset.current.y-=dy}else orbit.current=rotateOrbit(orbit.current,dx,dy);schedule.current()}}}/>
+    {scene.nodes.length>0&&<div style={{position:'absolute',top:48,right:15,display:'flex',gap:2,padding:3,border:'1px solid #354039',borderRadius:6,background:'#171e1be8',zIndex:3}} aria-label="3D view controls">
+      {(['rotate','pan'] as const).map(value=><button key={value} type="button" aria-pressed={mode===value} onClick={()=>{interactionMode.current=value;setMode(value)}} style={{padding:'5px 9px',minHeight:30,fontSize:11,color:mode===value?'#d9ece4':'#8b9c93',background:mode===value?'#2d3a33':'transparent',borderRadius:3}}>{value==='rotate'?'Rotate 3D':'Pan'}</button>)}
+      <button type="button" onClick={fit} title="Reset view (F)" style={{padding:'5px 9px',minHeight:30,fontSize:11,color:'#9aaa9f',borderLeft:'1px solid #354039'}}>Reset</button>
+    </div>}
     {!scene.nodes.length&&<div style={{position:'absolute',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,transform:'translateY(-30px)',pointerEvents:'none',color:'#8e8e8e'}}><svg width="58" height="58" viewBox="0 0 58 58" fill="none" aria-hidden="true"><circle cx="29" cy="29" r="6" stroke="#9c9c9c"/><circle cx="29" cy="29" r="2" fill="#cecece"/><path d="M29 23V9M35 29h14M29 35v14M23 29H9M33.3 24.7l10-10M24.7 33.3l-10 10M24.7 24.7l-10-10M33.3 33.3l10 10" stroke="#4c4c4c"/><circle cx="29" cy="8" r="2" fill="#737373"/><circle cx="50" cy="29" r="2" fill="#737373"/><circle cx="29" cy="50" r="2" fill="#737373"/><circle cx="8" cy="29" r="2" fill="#737373"/></svg><span style={{fontSize:13,color:'#c1c1c1'}}>Your crawl starts here.</span><span style={{fontSize:10,maxWidth:290,textAlign:'center',lineHeight:1.7}}>Launch a crawl to see real pages and the links they reveal.</span></div>}
     {hover&&<div className="graph-tooltip" style={{maxWidth:'calc(100% - 32px)',background:'#1d1d1d',borderColor:'#424242',color:'#dcdcdc',zIndex:3,lineHeight:1.6,overflowWrap:'anywhere'}}><div style={{fontSize:9,color:'#9c9c9c',textTransform:'uppercase',letterSpacing:1}}>{hover.status}</div>{hover.label}<div style={{fontSize:9,color:'#898989',maxWidth:460,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{hover.url}</div></div>}
   </div>;

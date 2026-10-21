@@ -7,7 +7,7 @@ import { detectPaywall } from "./free-access.ts";
 export interface AvailabilityOptions {fetcher?:typeof fetch;timeoutMs?:number}
 export interface AvailableDocument {url:string;kind:"pdf"|"html"}
 const MAX_HTML_BYTES=128*1024;
-const USER_AGENT="SignalResearch/1.0 (+https://signal-research-crawler.sk1616.chatgpt.site/; public document availability check)";
+const USER_AGENT="RadixAI/1.0 (+https://radixai.sk1616.chatgpt.site/; public document availability check)";
 const defaultFetcher:typeof fetch=(input,init)=>globalThis.fetch(input,init);
 
 function publicUrl(address:string,base?:string):string|null {

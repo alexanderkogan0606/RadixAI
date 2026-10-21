@@ -5,7 +5,7 @@ type Company={cik:string;name:string;tickers:string[];aliases?:string[]};
 type Intent={forms:string[];year?:number;quarter?:number;periodEnd?:string;calendar:boolean;latest:boolean};
 export interface FilingDiscoveryResult {documents:DiscoveredDocument[];status:ProviderStatus}
 const PROVIDER="SEC EDGAR" as const;
-const USER_AGENT="SignalResearch/1.0 (+https://signal-research-crawler.sk1616.chatgpt.site/)";
+const USER_AGENT="RadixAI/1.0 (+https://radixai.sk1616.chatgpt.site/)";
 const MAX_BYTES=2_000_000, MAX_COMPANIES=2, MAX_DOCUMENTS=6;
 const defaultFetcher:typeof fetch=(input,init)=>globalThis.fetch(input,init);
 const row=(value:unknown):Row=>value&&typeof value==="object"&&!Array.isArray(value)?value as Row:{};

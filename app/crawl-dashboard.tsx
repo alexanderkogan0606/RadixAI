@@ -1,16 +1,17 @@
 'use client';
 import {useEffect,useMemo,useState,type CSSProperties} from 'react';
 import {ArrowUpRight} from 'lucide-react';
-import {computeCrawlMetrics} from '../lib/crawl-metrics';
+import {computeCrawlMetrics,computeCrawlMetadata} from '../lib/crawl-metrics';
 import {parseAgentReview,AGENT_REVIEW_PREFIX} from '../lib/crawl-supervision';
+import './crawl-dashboard.css';
 
 type MetricInput=NonNullable<Parameters<typeof computeCrawlMetrics>[0]>;
-type DashboardJob=NonNullable<MetricInput['job']>&{id?:string;processed?:number;queued?:number;errors?:number;maxPages?:number};
+type DashboardJob=NonNullable<MetricInput['job']>&{id?:string;processed?:number;indexed?:number;queued?:number;errors?:number;maxPages?:number;maxDepth?:number};
 type CrawlEvent={id:string;time:string;level:string;message:string;url?:string};
 type DashboardProps={
  job?:DashboardJob|null;events:CrawlEvent[];currentUrl:string;fetching:boolean;replay:boolean;
  discovered:number;telemetryError?:boolean;pages?:MetricInput['pages'];frontier?:MetricInput['frontier'];
- edges?:Array<{source:string;target:string}>;query?:string;now?:number;
+ edges?:Array<{source:string;target:string}>;query?:string;now?:number;snapshotLimited?:boolean;
 };
 const EMPTY:never[]=[];
 const ACCENTS=['#65f5b6','#57d9ff','#fa79d9','#edf47a','#ffad78','#b1a1ff'];
@@ -35,12 +36,13 @@ function Sparkline({values,color,label,fixedMax}:{values:number[];color:string;l
  </svg>;
 }
 
-export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError,pages=EMPTY,frontier=EMPTY,edges=EMPTY,query='',now}:DashboardProps){
+export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError,pages=EMPTY,frontier=EMPTY,edges=EMPTY,query='',now,snapshotLimited=false}:DashboardProps){
  const [clock,setClock]=useState(Date.now());
  const live=job?.status==='running'&&!replay;
  useEffect(()=>{if(!live)return;setClock(Date.now());const timer=setInterval(()=>setClock(Date.now()),1000);return()=>clearInterval(timer)},[live,job?.id]);
  // The clock updates the elapsed label; metadata and frontier analysis only rerun when data changes.
- const snapshot=useMemo(()=>{const sampledAt=now??Date.now();return {sampledAt,metrics:computeCrawlMetrics({pages,frontier,events,edges,query,job,now:sampledAt,replay})}},[pages,frontier,events,edges,query,job,now,replay]);
+ const metadata=useMemo(()=>computeCrawlMetadata({pages,query}),[pages,query]);
+ const snapshot=useMemo(()=>{const sampledAt=now??Date.now();return {sampledAt,metrics:computeCrawlMetrics({pages,frontier,events,edges,query,job,now:sampledAt,replay},metadata)}},[metadata,pages,frontier,events,edges,query,job,now,replay]);
  const {metrics}=snapshot;
  const elapsed=metrics.elapsedMs===null?null:metrics.elapsedMs+(live&&now===undefined?Math.max(0,clock-snapshot.sampledAt):0);
  const wordsPerMinute=elapsed&&metrics.metadataWordCount?metrics.metadataWordCount*60000/elapsed:null;
@@ -61,7 +63,10 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
  const logCount=job?events.length:null;
  const processed=job?job.processed??0:null,queued=job?job.queued??0:null,errors=job?job.errors??0:null;
  const budget=job?.maxPages?Math.min(100,Math.max(0,(job.processed||0)/job.maxPages*100)):0;
- return <div className="crawl-telemetry"><section className="crawl-dashboard" aria-label="Crawl telemetry">
+ const sampled=snapshotLimited||metrics.limited;
+ const endReason=job?.status==='completed'?([...orderedEvents].reverse().find(event=>/page limit|queue exhausted|complete|no .*URLs/i.test(event.message))?.message.replace(/^Stage · complete · /,'')):undefined;
+ const runHint=replay?'Recorded activity: use the timeline to inspect this crawl.':job?.status==='paused'?'Queue saved. Resume this crawl when you are ready.':job?.status==='completed'?endReason||'This crawl has finished. Review the saved pages in Research results.':live?fetching?'Fetching the current destination, then checking relevance and access.':'Waiting for the next queued request. Keep the workspace open to continue.':'Choose a research objective and starting documents to begin.';
+ return <div className="crawl-telemetry"><section className="crawl-run-overview" aria-label="Crawl progress overview"><div><span className="eyebrow">{replay?'Recorded crawl':live?'Live crawl':job?'Crawl summary':'Crawl dashboard'}</span><p>{runHint}</p></div><dl><div><dt>Pages checked</dt><dd>{number(processed)}<small> / {number(job?.maxPages)}</small></dd></div><div><dt>Pages saved</dt><dd>{job?number(job.indexed??pages.length):'—'}</dd></div><div><dt>Queue remaining</dt><dd>{number(queued)}</dd></div><div><dt>Depth limit</dt><dd>{job?number(job.maxDepth):'—'}<small> links</small></dd></div></dl>{sampled&&<p className="crawl-sample-note">{replay?'Replay reflects the recorded pages available in this view.':'Run totals above are exact.'} Network and website charts use a bounded view; metadata charts cover {metrics.pagesAnalyzed.toLocaleString()} loaded pages. All saved pages remain in Results and Export.</p>}</section><section className="crawl-dashboard" aria-label="Crawl telemetry">
   <section className="telemetry-panel telemetry-log" aria-label="Crawl log" style={accent(ACCENTS[0])}>
    <header className="telemetry-heading"><h2>Crawl log</h2><span title="Events loaded for this view">{number(logCount)}{job?' events':''}</span></header>
    <ol className="telemetry-event-list" aria-label="Latest recorded crawl events">
@@ -74,7 +79,7 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
   </section>
 
   <section className="telemetry-panel telemetry-sections" aria-label="Website section progress" style={accent(ACCENTS[1])}>
-   <header className="telemetry-heading"><h2>Sections</h2><span>{job?metrics.websiteCount:'—'}{job?' sites':''}</span></header>
+   <header className="telemetry-heading"><h2>Websites</h2><span>{job?metrics.websiteCount:'—'}{job?' sites':''}</span></header>
    <div className="telemetry-site-list">
     {metrics.websites.map((site,i)=><div className="telemetry-site" key={site.hostname} style={accent(ACCENTS[i%ACCENTS.length])}>
      <div><span title={site.hostname}>{site.hostname}</span><b title={`${site.checked} checked of ${site.discovered} discovered URLs; ${site.queued} queued, ${site.processing} in progress, ${site.failed} blocked or failed, ${site.discovered-site.checked-site.queued-site.processing} unvisited or unresolved`}>{site.checked}/{site.discovered}</b></div>
@@ -82,13 +87,13 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
     </div>)}
     {!metrics.websites.length&&<p className="telemetry-empty">Website progress appears as URLs enter the queue.</p>}
    </div>
-   <footer className="telemetry-footer"><span>checked / discovered</span><b>{job?number(discoveredCount):'—'} URLs</b></footer>
+   <footer className="telemetry-footer"><span>{sampled?'visible checked / discovered':'checked / discovered'}</span><b>{job?number(discoveredCount):'—'} URLs</b></footer>
    {metrics.websiteCount>6&&<p className="telemetry-note">Top 6 of {metrics.websiteCount} websites</p>}
    <div className="telemetry-budget" title={`${number(processed)} of ${number(job?.maxPages)} page budget used`}><i style={{width:`${budget}%`}}/></div>
   </section>
 
   <section className="telemetry-panel telemetry-coverage" aria-label="Coverage radar" style={accent(ACCENTS[0])}>
-   <header className="telemetry-heading"><h2>Coverage radar</h2><span>{metrics.pagesAnalyzed?`${metrics.pagesAnalyzed} pages`:'—'}</span></header>
+   <header className="telemetry-heading"><h2>Topic coverage</h2><span>{metrics.pagesAnalyzed?`${metrics.pagesAnalyzed} pages`:'—'}</span></header>
    <svg className="telemetry-radar" viewBox="0 0 240 172" role="img" aria-label={radarRows.length?`Captured metadata coverage: ${radarRows.map(row=>`${row.term} in ${Math.round(row.sharePercent)} percent of pages`).join('; ')}.`:'No captured metadata to chart.'}>
     {radarCount>=3?[16,33,49].map(radius=><polygon key={radius} points={radarPolygon(radius)} className="telemetry-radar-grid"/>):[16,33,49].map(radius=><circle key={radius} cx="120" cy="86" r={radius} className="telemetry-radar-grid"/>)}
     {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,49),[lx,ly]=radarPoint(i,67);return <g key={row.term}><path d={`M120 86L${x} ${y}`} className="telemetry-radar-grid"/><text x={lx} y={ly+4} textAnchor={lx<100?'end':lx>140?'start':'middle'} fill={colorFor(row.term)}>{row.term.length>6?`${row.term.slice(0,5)}…`:row.term}<title>{row.term}: {Math.round(row.sharePercent)}% of captured metadata</title></text></g>})}
@@ -102,7 +107,7 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
 
   <section className="telemetry-panel telemetry-heat" aria-label="Word heatmap" style={accent(ACCENTS[2])}>
    <header className="telemetry-heading"><h2>Word heat</h2><span>{metrics.pagesAnalyzed?number(metrics.metadataWordCount):'—'} words</span></header>
-   <div className="telemetry-heat-grid" role="img" aria-label={metrics.columns.length?`Term presence across the latest ${metrics.columns.length} captured pages. Colored cells mean the term is present; dark cells mean absent. Counts include all captured pages.`:'No captured metadata available for word heatmap.'}>
+   <div className="telemetry-heat-grid" role="img" aria-label={metrics.columns.length?`Term presence across the latest ${metrics.columns.length} analyzed pages. Colored cells mean the term is present; dark cells mean absent. Counts cover ${metrics.pagesAnalyzed} analyzed pages.`:'No captured metadata available for word heatmap.'}>
     {radarRows.map(row=><div className="telemetry-heat-row" key={row.term} style={accent(colorFor(row.term))}>
      <span className="telemetry-term" title={row.term}>{row.term}</span><div className="telemetry-heat-cells">{row.hits.map((hit,i)=><i key={metrics.columns[i]?.id||i} className={hit?'is-present':''} title={`${row.term}: ${hit?'present':'absent'} in ${metrics.columns[i]?.title||metrics.columns[i]?.url||'page metadata'}`}/>)}</div><b title={`Present in ${row.documentsWithTerm} of ${metrics.pagesAnalyzed} captured pages`}>{row.documentsWithTerm}</b>
     </div>)}
@@ -110,11 +115,11 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
    </div>
    <div className="telemetry-heat-legend"><span>older → newer</span><span>{metrics.columns.length?`${metrics.columns.length} pages`:'—'}</span></div>
    <div className="telemetry-word-rate"><span>metadata words / min</span><strong>{number(wordsPerMinute)}</strong></div>
-   <p className="telemetry-note">Colored = present · totals across all pages</p>
+   <p className="telemetry-note">Colored = present · {metrics.pagesAnalyzed} pages analyzed</p>
   </section>
 
   <section className="telemetry-panel telemetry-score" aria-label="Metadata match score" style={accent(ACCENTS[3])}>
-   <header className="telemetry-heading"><h2>Spec score</h2><span>{isRecorded?'recorded':live?'live':'—'}</span></header>
+   <header className="telemetry-heading"><h2>Query match</h2><span>{isRecorded?'recorded':live?'live':'—'}</span></header>
    <Sparkline values={metrics.matchHistory.slice(-24).map(point=>point.score)} color={ACCENTS[3]} fixedMax={100} label={metrics.matchHistory.length?'Query term match in captured metadata, oldest to newest.':'No query match samples.'}/>
    <svg className="telemetry-gauge" viewBox="0 0 160 127" role="img" aria-label={score===null?'Metadata match unavailable until query terms and captured pages exist.':`Metadata match ${Math.round(score)} percent. Mean query term coverage in captured page titles and summaries; this does not measure source quality.`}>
     <circle cx="80" cy="63" r="47" fill="none" stroke="#33352a" strokeWidth="7" strokeDasharray={`${circumference*.75} ${circumference*.25}`} strokeLinecap="round" transform="rotate(135 80 63)"/>
@@ -127,7 +132,7 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
   </section>
 
   <section className="telemetry-panel telemetry-code" aria-label="Crawler event trace and fetch durations" style={accent(ACCENTS[4])}>
-   <header className="telemetry-heading"><h2>Crawler.ts</h2><span className={live?'telemetry-live-label':''}>{state}</span></header>
+   <header className="telemetry-heading"><h2>Live review</h2><span className={live?'telemetry-live-label':''}>{state}</span></header>
    <div className="telemetry-trace" aria-label="Actual crawler state and latest agent review">
     <span className="telemetry-code-comment">// latest rule-based review</span>
     <div className="telemetry-chief"><span>Chief of Staff</span><b className={`review-${latestReview?.decision||'waiting'}`} title={latestReview?`${latestReview.reason} ${latestReview.url}`:'No recorded review yet'}>{latestReview?decisionLabel(latestReview.decision):'—'}</b></div>

@@ -6,6 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { safeUrl, inScope, extractDocument, robotsRules, researchDomain, createJob, stepJob, controlJob, readState, readRun, addSource, setBookmark, exportDataChunks } from "../lib/crawler.ts";
 // @ts-expect-error Node requires the TypeScript extension for direct execution.
 import {parseAgentReview} from "../lib/crawl-supervision.ts";
+// @ts-expect-error Node requires the TypeScript extension for direct execution.
+import {CRAWL_LIMITS,CRAWL_PRESETS} from "../lib/crawl-presets.ts";
 
 test("URL validation rejects private and alternate encoded IP targets",()=>{
   for (const url of ["http://sec.gov/","https://127.0.0.1/","https://2130706433/","https://0x7f000001/","https://[::1]/","https://[::ffff:127.0.0.1]/","https://10.0.0.1/","https://169.254.169.254/","https://localhost/","https://service.internal/","https://localhost./","https://127.0.0.1.nip.io/","https://user:pass@sec.gov/","https://sec.gov:444/"]) {
@@ -41,14 +43,14 @@ test("RSS and Atom extract article URLs and summaries",()=>{
   assert.equal(atom.feedEntries[0].url,"https://research.org/report");
 });
 test("Robots uses most specific agent groups and longest allow/disallow match",()=>{
-  const rules = "User-agent: *\nDisallow: /\nUser-agent: ResearchAtlasBot\nDisallow: /private\nAllow: /private/public\nCrawl-delay: 3";
+  const rules = "User-agent: *\nDisallow: /\nUser-agent: RadixAIBot\nDisallow: /private\nAllow: /private/public\nCrawl-delay: 3";
   assert.deepEqual(robotsRules(rules,"/paper"),{allowed:true,delayMs:3000});
   assert.equal(robotsRules(rules,"/private/secret").allowed,false);
   assert.equal(robotsRules(rules,"/private/public/report").allowed,true);
   assert.equal(robotsRules("User-agent: *\nDisallow: /*.pdf$","/x.pdf").allowed,false);
   assert.equal(robotsRules("User-agent: *\nDisallow: /*.pdf$","/x.pdf/other").allowed,true);
   assert.equal(robotsRules("User-agent: *\nDisallow:","/anything").allowed,true);
-  assert.equal(robotsRules("User-agent: Research\nAllow: /secret\nUser-agent: ResearchAtlasBot\nDisallow: /secret","/secret").allowed,false);
+  assert.equal(robotsRules("User-agent: Radix\nAllow: /secret\nUser-agent: RadixAIBot\nDisallow: /secret","/secret").allowed,false);
   assert.equal(robotsRules("User-agent: *\nDisallow: /\nUser-agent:\nAllow: /","/secret").allowed,false);
 });
 
@@ -494,5 +496,98 @@ test("Historical run graph loads outside the dashboard frontier window and enfor
     assert.equal(bounded.events.length,500);
     assert.equal(bounded.counts.events,506);
     assert.equal(bounded.truncated.events,true);
+  }finally{sqlite.close();}
+});
+
+test("Crawl presets and custom budgets enforce server limits before writing jobs",async()=>{
+  const {db,sqlite}=testDatabase(),urls=["https://publicresearch.org/report"];
+  try{
+    for(const input of [{maxPages:4},{maxPages:2001},{maxPages:5.5},{maxDepth:-1},{maxDepth:9},{maxDepth:1.5},{preset:"unlimited"},{urls:Array.from({length:61},(_,i)=>`https://publicresearch.org/${i}`)}]){
+      await assert.rejects(()=>createJob(db,"alice",{urls,...input},[]));
+    }
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM atlas_jobs").get()?.n,0);
+    const defaults=await createJob(db,"alice",{urls},[]);
+    assert.equal(defaults.job.maxPages,500);assert.equal(defaults.job.maxDepth,5);assert.equal(defaults.job.scope,"same-domain");
+    for(const preset of CRAWL_PRESETS){
+      const created=await createJob(db,"alice",{urls,preset:preset.id},[]);
+      assert.equal(created.job.maxPages,preset.maxPages);assert.equal(created.job.maxDepth,preset.maxDepth);assert.equal(created.job.scope,preset.scope);
+    }
+    const many=await createJob(db,"alice",{urls:Array.from({length:60},(_,i)=>`https://publicresearch.org/${i}`),maxPages:2000,maxDepth:8},[]);
+    assert.equal(many.job.queued,60);assert.equal(many.job.maxPages,CRAWL_LIMITS.maxPages);
+  }finally{sqlite.close();}
+});
+
+test("Deep runs persist every hop, resume an interrupted queue item and stop at the requested depth",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch,requests:string[]=[];
+  cacheRobots("publicresearch.org");
+  globalThis.fetch=(async(input:RequestInfo|URL,init?:RequestInit)=>{
+    const url=String(input),depth=Number(new URL(url).pathname.split("/").pop());requests.push(url);
+    assert.match(new Headers(init?.headers).get("user-agent")||"",/^RadixAIBot\/1\.0/);
+    return new Response(`<title>Bank merger study ${depth}</title><p>Bank mergers change lending costs and competition among financial institutions.</p><a href="/depth/${depth+1}">Bank merger follow-up</a>`,{headers:{"content-type":"text/html"}});
+  }) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/depth/0"],preset:"deep"},[]),id=String(created.job.id);
+    for(let i=0;i<2;i++){sqlite.exec("UPDATE atlas_hosts SET next_allowed_at=0");const result=await stepJob(db,"alice",id);assert.equal(result.job.processed,i+1);}
+    await controlJob(db,"alice",id,"pause");
+    sqlite.prepare("UPDATE atlas_queue SET status='processing' WHERE job_id=? AND status='queued'").run(id);
+    assert.equal((await stepJob(db,"alice",id)).job.processed,2);assert.equal(requests.length,2);
+    await controlJob(db,"alice",id,"resume");
+    for(let i=2;i<6;i++){sqlite.exec("UPDATE atlas_hosts SET next_allowed_at=0");const result=await stepJob(db,"alice",id);assert.equal(result.job.processed,i+1);assert.equal(requests.length,i+1,"Each step fetches just one document.");}
+    const run=await readRun(db,"alice",id);
+    assert.equal(run.job.status,"completed");assert.equal(run.job.processed,6);assert.equal(run.job.indexed,6);assert.equal(run.frontier.length,6);
+    assert.equal(Math.max(...run.frontier.map(item=>Number(item.depth))),5);assert.equal(requests.at(-1),"https://publicresearch.org/depth/5");
+    assert.ok(run.events.some(event=>String(event.message).includes("All discovered URLs have been processed")));
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("A resumed deep run respects its persisted page budget and preserves unvisited discoveries",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;let requests=0;
+  cacheRobots("publicresearch.org");
+  globalThis.fetch=(async()=>{requests++;return new Response('<title>Bank merger outcomes</title><p>Bank mergers change operating costs and competition among financial institutions.</p><a href="/next">More bank merger evidence</a>',{headers:{"content-type":"text/html"}});}) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/article"],preset:"deep"},[]),id=String(created.job.id);
+    sqlite.prepare("UPDATE atlas_jobs SET processed=499,indexed=499 WHERE id=?").run(id);
+    await controlJob(db,"alice",id,"pause");await stepJob(db,"alice",id);assert.equal(requests,0);
+    await assert.rejects(()=>controlJob(db,"bob",id,"resume"),/not found/);
+    await controlJob(db,"alice",id,"resume");
+    const last=await stepJob(db,"alice",id);assert.equal(last.job.status,"completed");assert.equal(last.job.processed,500);assert.equal(last.job.indexed,500);assert.equal(last.job.errors,0);
+    await stepJob(db,"alice",id);assert.equal(requests,1,"Reopening a complete run cannot fetch past its budget.");
+    const pending=sqlite.prepare("SELECT status FROM atlas_queue WHERE job_id=? AND url=?").get(id,"https://publicresearch.org/next");assert.equal(pending?.status,"skipped");
+    assert.ok((await readRun(db,"alice",id)).events.some(event=>String(event.message).includes("Page limit reached")));
+    await assert.rejects(()=>controlJob(db,"alice",id,"resume"),/complete/);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Extensive discovery stops at ten thousand saved queue entries while run snapshots stay bounded",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publicresearch.org");
+  globalThis.fetch=(async()=>new Response('<title>Bank merger evidence</title><p>Bank mergers change operating costs and competition among financial institutions.</p><a href="/new-1">Bank merger one</a><a href="/new-2">Bank merger two</a><a href="/new-3">Bank merger three</a>',{headers:{"content-type":"text/html"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/article"],preset:"extensive"},[]),id=String(created.job.id);
+    const queue=sqlite.prepare("INSERT INTO atlas_queue VALUES(?,'alice',?,'seed',?,'Finance','Research',1,'https://publicresearch.org/article','done','2026-01-01')");
+    for(let i=0;i<CRAWL_LIMITS.maxQueue-2;i++)queue.run(`old-${i}`,id,`https://publicresearch.org/old-${i}`);
+    await stepJob(db,"alice",id);
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM atlas_queue WHERE job_id=?").get(id)?.n,10_000);
+    assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM atlas_queue WHERE job_id=? AND status='queued'").get(id)?.n,1);
+    const pages=sqlite.prepare("INSERT INTO atlas_pages VALUES(?,'alice',?,'seed',?,'Bank merger study','Bank merger metadata','Finance','Research','[]',1,NULL,'2026-01-01','indexed')");
+    for(let i=0;i<500;i++)pages.run(`saved-${i}`,id,`https://publicresearch.org/saved-${i}`);
+    const edge=sqlite.prepare("INSERT INTO atlas_edges VALUES(?,'alice',?,'https://publicresearch.org/article',?)");
+    for(let i=0;i<3010;i++)edge.run(`edge-${i}`,id,`https://publicresearch.org/edge-${i}`);
+    const run=await readRun(db,"alice",id);
+    assert.equal(run.pages.length,501,"Deep historical views are no longer cut to300pages.");
+    assert.equal(run.frontier.length,2000);assert.equal(run.counts.frontier,10_000);assert.equal(run.truncated.frontier,true);
+    assert.equal(run.edges.length,3000);assert.equal(run.counts.edges,3011);assert.equal(run.truncated.edges,true);
+    const state=await readState(db,"alice");assert.equal(state.frontier.length,2000);assert.equal(state.edges.length,3000);assert.equal(state.counts.frontier,10_000);assert.equal(state.truncated.frontier,true);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Bounded graph snapshots prioritize a running crawl over older completed edges",async()=>{
+  const {db,sqlite}=testDatabase();
+  try{
+    sqlite.exec("INSERT INTO atlas_jobs VALUES('old','alice','query','completed','same-domain',500,5,1,1,0,'[]','2026-01-02','2026-01-02',0)");
+    const edge=sqlite.prepare("INSERT INTO atlas_edges VALUES(?,'alice','old','https://old.org/root',?)");
+    for(let i=0;i<3010;i++)edge.run(`old-edge-${i}`,`https://old.org/${i}`);
+    sqlite.exec("INSERT INTO atlas_jobs VALUES('active','alice','query','running','same-domain',500,5,1,1,0,'[]','2026-01-01','2026-01-01',0); INSERT INTO atlas_edges VALUES('active-edge','alice','active','https://current.org/root','https://current.org/child')");
+    const state=await readState(db,"alice");assert.equal(state.edges.length,3000);assert.equal(state.edges[0].jobId,"active");assert.equal(state.counts.edges,3011);assert.equal(state.truncated.edges,true);
+    assert.deepEqual((await readState(db,"bob")).edges,[]);
   }finally{sqlite.close();}
 });

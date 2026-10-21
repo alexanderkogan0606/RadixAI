@@ -3,13 +3,13 @@ export interface ResourceCandidate {url:string;title?:string;name?:string;descri
 export type ResourceRejection="access-gate"|"error"|"navigation"|"off-topic"|"insufficient-content";
 export interface ResourceAssessment {eligible:boolean;reason:ResourceRejection|null;matchedTerms:string[];score:number}
 
-const stop=new Set("a an and are as at be been being but by can could did do does for from had has have how i if in into is it its me my of on or our please should show some tell than that the their them then there these they this those through to us use used using was were what when where which who why will with would you your about find help explain resource resources source sources research question anything related information overview understanding understand learn explore article articles paper papers report reports document documents case cases study studies examples example business finance technology tech insights insight analysis latest recent new free paid only just relevant good best detailed comprehensive evidence".split(" "));
+const stop=new Set("a an and are as at be been being but by can could did do does for from had has have how i if in into is it its me my of on or our please should show some tell than that the their them then there these they this those through to us use used using was were what when where which who why will with would you your about find help explain resource resources source sources research question anything related information overview understanding understand learn explore article articles paper papers report reports document documents case cases study studies examples example business finance technology tech insights insight analysis latest recent new free paid only just relevant good best detailed comprehensive evidence want need looking regarding concerning specifically specific provide usecases".split(" "));
 const forms:Record<string,string>={mergers:"merger",acquisition:"merger",acquisitions:"merger",acquired:"merger",acquire:"merger",takeover:"merger",takeovers:"merger",banking:"bank",banks:"bank",pricing:"price",prices:"price",priced:"price",costs:"cost",companies:"company",failures:"failure",failed:"failure",failing:"failure",startups:"startup",models:"model",llms:"llm",risks:"risk",datasets:"dataset",deployments:"deployment",deploying:"deployment",deployed:"deployment",implementation:"deployment",competition:"competitor",competitors:"competitor",competitive:"competitor",valuations:"valuation",returns:"return"};
 const genericObjectives=/^(?:(?:live|crawl(?:er)?|spider|graph|animation|replay|playback|smoke|integration|backend|frontend|validation|test(?:ing)?|demo|check|run|research|general|sample|example|metadata|public|free|resources?|sources?)\s*)+$/i;
 function clean(value:unknown){return typeof value==="string"?value.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<[^>]*>/g," ").replace(/&amp;|&#38;/gi,"&").replace(/[\u0000-\u001f\u007f]/g," ").replace(/\s+/g," ").trim().slice(0,8000):""}
 function normalizedText(value:string){
   return clean(value).normalize("NFKC").toLowerCase().replace(/[’']s\b/g,"")
-    .replace(/\bdeep[\s-]?dive\b/g," ")
+    .replace(/\bdeep[\s-]?dive\b/g," ").replace(/\bsoftware[ -]as[ -]a[ -]service\b/g," saas ")
     .replace(/\bm\s*(?:&|and)\s*a\b/g," merger ").replace(/\bartificial intelligence\b/g," ai ").replace(/\bmachine learning\b/g," ai ")
     // Customer acquisition is a marketing concept, not a corporate acquisition.
     .replace(/\b(customer|user|talent|traffic|data) acquisitions?\b/g,"$1acquisition");
@@ -17,7 +17,7 @@ function normalizedText(value:string){
 function tokens(value:string){return (normalizedText(value).match(/[\p{L}\p{N}]+/gu)||[]).filter(term=>term.length>1&&!stop.has(term)).map(term=>forms[term]||term)}
 export function queryTerms(query=""):string[]{const value=clean(query);return genericObjectives.test(value)?[]:[...new Set(tokens(value))].slice(0,20)}
 export function cleanSearchQuery(query=""):string {
-  return clean(query).replace(/\bm\s*&\s*a\b/gi,"mergers and acquisitions").replace(/^(?:please\s+)?(?:can you\s+|could you\s+)?(?:find|show|give|tell)\s+(?:me\s+)?(?:research\s+(?:on|about)\s+|(?:information|resources?|papers?|articles?)\s+(?:on|about)\s+)?/i,"").replace(/[?]+$/g,"").trim().slice(0,300);
+  return clean(query).replace(/\bm\s*&\s*a\b/gi,"mergers and acquisitions").replace(/^(?:please\s+)?(?:i(?:\s+am|[’\']m)?\s+)?(?:want|need|am looking for|looking for|would like)\s+(?:some\s+)?(?:(?:research|information|resources?|papers?|articles?|case studies)(?:\s+and\s+(?:research|case studies|reports))?\s+(?:on|about|regarding|concerning)\s+)?/i,"").replace(/^(?:please\s+)?(?:can you\s+|could you\s+)?(?:find|show|give|tell)\s+(?:me\s+)?(?:research\s+(?:on|about)\s+|(?:information|resources?|papers?|articles?)\s+(?:on|about)\s+)?/i,"").replace(/[?]+$/g,"").trim().slice(0,300);
 }
 
 function urlInfo(address:string){try{const url=new URL(address),path=decodeURIComponent(url.pathname).toLowerCase().replace(/\/+$/,"");return {url,path}}catch{return null}}
@@ -29,6 +29,15 @@ const gateNotice=/\b(?:your session (?:is (?:about to|going to) expire|has expir
 const gateTitle=/^(?:sign\s*in|log\s*in|login|register|access denied|just a moment|security check|verify you are human|captcha|session expired|request rejected)(?:\b|\s*[|—–-])/i;
 const errorTitle=/^(?:(?:error\s*)?(?:404|403|500|502|503)\b|(?:page|document|file|resource) (?:not found|unavailable)|not found|service unavailable|internal server error|something went wrong|temporarily unavailable)/i;
 const boilerplate=/^(?:your session|we use cookies|this (?:site|website) uses cookies|by (?:using|continuing to use) (?:this|our) (?:site|website|service)|accept (?:all )?cookies|all rights reserved|copyright\b|loading(?:\.{0,3})?$|please wait|welcome to|source added to your personal research catalog|metadata captured from this page|url discovered by the crawler|no (?:description|summary)(?: is)? available)/i;
+
+/** Land acquisition is a different subject from acquiring companies. Respect an explicit land-research objective. */
+export function matchesAcquisitionContext(resource:ResourceCandidate,query=""):boolean {
+  if(!queryTerms(query).includes("merger")||/\b(?:land|resettlement|eminent domain|compulsory purchase)\b/i.test(query))return true;
+  const title=clean(resource.title)||clean(resource.name),lead=clean(resource.description).slice(0,450);
+  if(!/\b(?:land[\s-]+acquisitions?|resettlement|expropriation|compensation|eminent domain|compulsory purchase)\b/i.test(`${title} ${lead}`))return true;
+  const corporateTitle=/\b(?:corporat\w*|compan\w*|firms?|business\w*|banks?|shareholders?|enterprises?)\b/i.test(title)&&/\b(?:mergers?|acquisitions?|takeovers?)\b/i.test(title);
+  return corporateTitle||/\b(?:mergers?|takeovers?|m\s*&\s*a)\b/i.test(title);
+}
 
 export function assessResource(resource:ResourceCandidate,query=""):ResourceAssessment {
   const title=clean(resource.title)||clean(resource.name),description=clean(resource.description),text=`${title} ${description}`,info=urlInfo(resource.url);
@@ -46,6 +55,7 @@ export function assessResource(resource:ResourceCandidate,query=""):ResourceAsse
   const detailedTitle=title.length>=45&&title.split(/\s+/).length>=7&&new Set(tokens(title)).size>=4;
   if(!title||boilerplate.test(description)||(!meaningfulSummary&&!detailedTitle))return reject("insufficient-content");
   if(wanted.length){
+    if(!matchesAcquisitionContext(resource,query))return reject("off-topic");
     const needed=wanted.length===1?1:2;
     if(matchedTerms.length<needed)return reject("off-topic");
     // A generic trailing term or year cannot compensate for missing the main subject.

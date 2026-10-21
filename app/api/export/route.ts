@@ -19,7 +19,7 @@ export async function GET(request:Request){
     });
     return new Response(stream,{headers:{
       "Content-Type":"application/json; charset=utf-8",
-      "Content-Disposition":`attachment; filename="signal-${kind}-${new Date().toISOString().slice(0,10)}.json"`,
+      "Content-Disposition":`attachment; filename="radixai-${kind}-${new Date().toISOString().slice(0,10)}.json"`,
       "X-Content-Type-Options":"nosniff",
     }});
   });

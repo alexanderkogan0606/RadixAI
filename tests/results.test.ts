@@ -61,6 +61,27 @@ test("Results paginate every run with stable equal-time ordering and full proven
   }finally{sqlite.close();}
 });
 
+test("Results hide corporate-M&A land false positives, merge exact aliases, and retain the document's original objective",async()=>{
+  const {db,sqlite}=database();
+  try{
+    const query="Mergers and acquisitions case studies",base={description:"This report studies corporate acquisitions, financial performance and shareholder outcomes with comparative company evidence.",provider:"OpenAlex",providerRecordUrl:"https://openalex.org/W123",access:"Free" as const,accessBasis:"Provider open-access evidence for this document.",type:"Research paper",domain:"Finance",query,foundAt:"2026-10-21T00:00:00.000Z"};
+    await saveDiscoveredDocuments(db,"alice",query,[
+      {...base,id:"land",title:"Land acquisition and involuntary resettlement policy",description:"This report studies land acquisition compensation and resettlement in infrastructure financing projects.",url:"https://repository.edu/reports/land"},
+      {...base,id:"old",title:"Corporate acquisitions and shareholder performance outcomes",url:"https://zenodo.org/record/7050039",doi:"10.5281/zenodo.7050038"},
+      {...base,id:"alias",title:"Corporate acquisitions and shareholder performance outcomes",url:"https://zenodo.org/records/7050039",doi:"10.5281/zenodo.7050039"},
+    ]);
+    await saveDiscoveredDocuments(db,"alice","land acquisition resettlement",[{...base,id:"actual-land",title:"Land acquisition and involuntary resettlement policy",description:"This report studies land acquisition compensation and resettlement in infrastructure financing projects.",url:"https://repository.edu/reports/land-objective"}]);
+    const result=await readResults(db,"alice",new URLSearchParams(),()=>"Free");
+    assert.equal(result.rawTotal,4);assert.equal(result.duplicateCount,1);assert.equal(result.excludedQualityCount,1);assert.equal(result.filteredTotal,2);
+    assert.ok(result.pages.some(page=>page.query==="land acquisition resettlement"));
+    const searched=await readResults(db,"alice",new URLSearchParams({q:"land"}),()=>"Free");
+    assert.equal(searched.filteredTotal,1);assert.equal(searched.pages[0].query,"land acquisition resettlement");
+    const archive=await readResults(db,"alice",new URLSearchParams({access:"all"}),()=>"Free");
+    assert.equal(archive.filteredTotal,3);assert.equal(Number(sqlite.prepare("SELECT count(*) AS n FROM atlas_documents").get()?.n),4);
+    assert.deepEqual((await readResults(db,"bob",new URLSearchParams(),()=>"Free")).pages,[]);
+  }finally{sqlite.close();}
+});
+
 test("Discovered documents merge with captures, remove generic failures, retain query provenance and deduplicate URLs",async()=>{
   const {sqlite,db,job,page}=database();
   try{
