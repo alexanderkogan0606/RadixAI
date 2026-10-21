@@ -27,6 +27,7 @@ export const queue = sqliteTable("atlas_queue", {
   sourceId: text("source_id").notNull(), url: text("url").notNull(), domain: text("domain").notNull(),
   category: text("category").notNull(), depth: integer("depth").notNull(), parentUrl: text("parent_url"),
   status: text("status").notNull(), createdAt: text("created_at").notNull(),
+  nextAttemptAt: integer("next_attempt_at").notNull().default(0), fetchState: text("fetch_state"),
 }, t => [uniqueIndex("atlas_queue_user_job_url").on(t.userId,t.jobId,t.url),index("atlas_queue_pending").on(t.jobId,t.status)]);
 
 export const events = sqliteTable("atlas_events", {

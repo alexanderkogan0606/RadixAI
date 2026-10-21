@@ -15,6 +15,13 @@
       "when": 1792556591985,
       "tag": "0001_discovered_documents",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792563483315,
+      "tag": "0002_crawl_resume",
+      "breakpoints": true
     }
   ]
 }

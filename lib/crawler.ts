@@ -25,7 +25,12 @@ export class ApiError extends Error {
   status: number;
   constructor(message: string, status = 400) { super(message); this.status = status; }
 }
-class WaitForHost extends Error {}
+class WaitForHost extends Error {
+  retryAt:number;
+  constructor(message:string,retryAt:number){super(message);this.retryAt=retryAt;}
+}
+type FetchPosition={url:string;redirects:number};
+type FetchProgress={document:FetchPosition;robots?:FetchPosition&{origin:string}};
 class CrawlBlocked extends Error {}
 class CrawlSkipped extends Error {}
 
@@ -333,11 +338,14 @@ async function reserveHost(db:DB,host:string,knownState?:Row) {
     state=await first(db,"SELECT * FROM atlas_hosts WHERE host=?",host);
   }
   const delay = Number(state?.next_allowed_at || 0)-Date.now();
-  if (delay > 1800) throw new WaitForHost("Waiting for the source's crawl delay.");
+  if (delay > 1800) throw new WaitForHost("Waiting for the source's crawl delay.",Number(state?.next_allowed_at));
   if (delay > 0) await new Promise(resolve=>setTimeout(resolve,delay+15));
   const timestamp = Date.now();
   const update = await statement(db,"UPDATE atlas_hosts SET next_allowed_at=?+MAX(crawl_delay,1000) WHERE host=? AND next_allowed_at<=?",timestamp,host,timestamp).run();
-  if (!update.meta.changes) throw new WaitForHost("Another crawl is accessing this host; retry shortly.");
+  if (!update.meta.changes) {
+    const reserved=await first(db,"SELECT next_allowed_at FROM atlas_hosts WHERE host=?",host);
+    throw new WaitForHost("Another crawl is accessing this host; retry shortly.",Math.max(Date.now()+1000,Number(reserved?.next_allowed_at)||0));
+  }
 }
 
 async function responseText(response:Response):Promise<string> {
@@ -356,20 +364,25 @@ async function responseText(response:Response):Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
-async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog,onStage?:(stage:"access"|"fetch",url:string)=>Promise<void>):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean;metadataSource?:CatalogSource}> {
-  let current = safeUrl(url);
-  for (let redirects=0;redirects<=3;redirects++) {
+async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog,onStage?:(stage:"access"|"fetch",url:string)=>Promise<void>,progress?:FetchProgress,checkpoint?:()=>Promise<void>):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean;metadataSource?:CatalogSource}> {
+  const position=robots?progress?.robots:progress?.document;
+  let current = safeUrl(position?.url||url);
+  for (let redirects=position?.redirects||0;redirects<=3;redirects++) {
     if(!robots)await onStage?.("access",current);
     if (!robots && !inScope(current,seedHosts,scope)) throw new CrawlSkipped("Redirect leaves the selected crawl scope.");
     if(!robots&&isKnownRestrictedUrl(current,catalog))throw new CrawlSkipped("Known paid or mixed-access destination skipped by the free-only policy.");
-    const hostState=!robots ? await checkRobots(db,current) : undefined;
+    const hostState=!robots ? await checkRobots(db,current,progress,checkpoint) : undefined;
     await reserveHost(db,new URL(current).hostname,hostState);
     if(!robots)await onStage?.("fetch",current);
     const response = await fetch(current,{redirect:"manual",signal:AbortSignal.timeout(8000),headers:{"User-Agent":`${BOT}/1.0 (public research metadata; respects robots.txt)`,Accept:robots?"text/plain":"text/html,application/rss+xml,application/atom+xml,application/xml;q=0.8"}});
     if ([301,302,303,307,308].includes(response.status)) {
       const location = response.headers.get("location"); await response.body?.cancel();
       if (!location) throw new CrawlSkipped("Redirect did not include a destination.");
-      current = safeUrl(location,current); continue;
+      current = safeUrl(location,current);
+      // Persist the next hop, including the redirect budget, before a host delay can yield.
+      // Retrying the original URL would reserve the same host again forever.
+      if(position){position.url=current;position.redirects=redirects+1;await checkpoint?.();}
+      continue;
     }
     const contentType = response.headers.get("content-type") || "";
     const knownDocument=!robots&&/application\/pdf/i.test(contentType)?sourceForUrl(current,catalog) as CatalogSource|undefined:undefined;
@@ -388,14 +401,15 @@ async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],sco
   throw new CrawlSkipped("Redirect limit reached.");
 }
 
-async function checkRobots(db:DB,url:string) {
+async function checkRobots(db:DB,url:string,progress?:FetchProgress,checkpoint?:()=>Promise<void>) {
   const u = new URL(url), host = u.hostname;
   let row = await first(db,"SELECT * FROM atlas_hosts WHERE host=?",host);
   if(!row){
     await statement(db,"INSERT OR IGNORE INTO atlas_hosts(host,next_allowed_at,crawl_delay) VALUES(?,0,1000)",host).run();
   }
   if (!row?.robots_fetched_at || Date.now()-Number(row.robots_fetched_at)>3_600_000) {
-    const fetched = await fetchText(db,`${u.origin}/robots.txt`,true);
+    if(progress&&progress.robots?.origin!==u.origin)progress.robots={origin:u.origin,url:`${u.origin}/robots.txt`,redirects:0};
+    const fetched = await fetchText(db,`${u.origin}/robots.txt`,true,[],"linked-domains",defaultCatalog,undefined,progress,checkpoint);
     let robotsText = fetched.body;
     if (fetched.status === 404 || fetched.status === 410) robotsText = "";
     else if (fetched.status < 200 || fetched.status >= 300) throw new CrawlBlocked(`Could not establish robots permission (HTTP ${fetched.status}); source was not fetched.`);
@@ -403,6 +417,7 @@ async function checkRobots(db:DB,url:string) {
     await statement(db,"UPDATE atlas_hosts SET robots_text=?,robots_status=?,robots_fetched_at=?,crawl_delay=?,next_allowed_at=MAX(next_allowed_at,?) WHERE host=?",robotsText,fetched.status,Date.now(),parsed.delayMs,Date.now()+parsed.delayMs,host).run();
     row=await first(db,"SELECT * FROM atlas_hosts WHERE host=?",host);
   }
+  if(progress?.robots){delete progress.robots;await checkpoint?.();}
   const rules = robotsRules(String(row?.robots_text || ""),u.pathname+u.search);
   if (!rules.allowed) throw new CrawlBlocked("Blocked by the source's robots.txt rules.");
   return row || undefined;
@@ -421,19 +436,26 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
     if (Number(job.processed) >= Number(job.max_pages)) {
       await finishJob(db,user,id,"Page limit reached."); return {job:publicJob(await getJob(db,user,id))};
     }
-    const candidates=await all(db,"SELECT * FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued' ORDER BY depth,created_at,id LIMIT 120",id,user);
+    const candidates=await all(db,"SELECT * FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued' AND next_attempt_at<=? ORDER BY depth,created_at,id LIMIT 120",id,user,Date.now());
     candidates.sort((a,b)=>Number(a.depth)-Number(b.depth)||linkPriority({url:String(b.url)},String(job.query))-linkPriority({url:String(a.url)},String(job.query)));
     item=candidates[0]||null;
-    if (!item) { await finishJob(db,user,id,"All discovered URLs have been processed."); return {job:publicJob(await getJob(db,user,id))}; }
-    const initialUrl=String(item.url);currentUrl=initialUrl;
-    await db.batch([statement(db,"UPDATE atlas_queue SET status='processing' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",`Fetching ${initialUrl}`,initialUrl),stageStatement(db,user,id,"access",`Checking public access, crawl scope and robots rules for ${initialUrl}`,initialUrl)]);
+    if (!item) {
+      const pending=await first(db,"SELECT MIN(next_attempt_at) AS retry_at FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued'",id,user);
+      if(pending?.retry_at!=null)return {job:publicJob(await getJob(db,user,id)),waiting:true,retryAt:Number(pending.retry_at)};
+      await finishJob(db,user,id,"All discovered URLs have been processed."); return {job:publicJob(await getJob(db,user,id))};
+    }
+    const initialUrl=String(item.url);
+    const progress:FetchProgress=item.fetch_state?JSON.parse(String(item.fetch_state)):{document:{url:initialUrl,redirects:0}};
+    const checkpoint=async()=>{await statement(db,"UPDATE atlas_queue SET fetch_state=? WHERE id=? AND user_id=?",JSON.stringify(progress),item!.id,user).run();};
+    currentUrl=progress.document.url;
+    await db.batch([statement(db,"UPDATE atlas_queue SET status='processing' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",`Fetching ${currentUrl}`,currentUrl),stageStatement(db,user,id,"access",`Checking public access, crawl scope and robots rules for ${currentUrl}`,currentUrl)]);
     const fetchStarted=Date.now();
     let firstAccess=true;
     const fetched = await fetchText(db,initialUrl,false,JSON.parse(String(job.seed_hosts)),String(job.scope),catalog,async(stage,url)=>{
       currentUrl=url;
       if(stage==="access"&&firstAccess){firstAccess=false;return;}
       await stageStatement(db,user,id,stage,stage==="access"?`Checking public access, crawl scope and robots rules for ${url}`:`Requesting document ${url}`,url).run();
-    });
+    },progress,checkpoint);
     const fetchSummary=`HTTP ${fetched.status} · ${Date.now()-fetchStarted} ms`;
     const accessGate=detectPaywall(fetched.body,fetched.status,fetched.contentType);
     if(accessGate)throw new CrawlSkipped(accessGate);
@@ -485,8 +507,10 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
     return {job:publicJob(updatedJob),...(storeMetadata?{page:publicPage(page)}:{quality})};
   } catch(error) {
     if (item && error instanceof WaitForHost) {
-      await db.batch([statement(db,"UPDATE atlas_queue SET status='queued' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",error.message,currentUrl||String(item.url))]);
-      return {job:publicJob(await getJob(db,user,id)),waiting:true};
+      const retryAt=Math.max(Date.now()+1000,error.retryAt);
+      const message=`${error.message} Deferred until ${new Date(retryAt).toISOString()}; other ready URLs can continue.`;
+      await db.batch([statement(db,"UPDATE atlas_queue SET status='queued',next_attempt_at=? WHERE id=? AND user_id=?",retryAt,item.id,user),eventStatement(db,user,id,"info",message,currentUrl||String(item.url))]);
+      return {job:publicJob(await getJob(db,user,id)),waiting:true,retryAt};
     }
     if (item) {
       const status = error instanceof CrawlBlocked ? "blocked" : error instanceof CrawlSkipped ? "skipped" : "error";

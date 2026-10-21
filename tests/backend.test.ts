@@ -60,7 +60,7 @@ function testDatabase(latencyMs=0) {
     CREATE TABLE atlas_sources(id TEXT PRIMARY KEY,user_id TEXT,name TEXT,url TEXT,domain TEXT,created_at TEXT,UNIQUE(user_id,url));
     CREATE TABLE atlas_jobs(id TEXT PRIMARY KEY,user_id TEXT,query TEXT,status TEXT,scope TEXT,max_pages INTEGER,max_depth INTEGER,processed INTEGER,indexed INTEGER,errors INTEGER,seed_hosts TEXT,created_at TEXT,updated_at TEXT,lease_until INTEGER);
     CREATE TABLE atlas_pages(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,source_id TEXT,url TEXT,title TEXT,description TEXT,domain TEXT,category TEXT,tags TEXT,depth INTEGER,parent_url TEXT,fetched_at TEXT,status TEXT,UNIQUE(user_id,job_id,url));
-    CREATE TABLE atlas_queue(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,source_id TEXT,url TEXT,domain TEXT,category TEXT,depth INTEGER,parent_url TEXT,status TEXT,created_at TEXT,UNIQUE(user_id,job_id,url));
+    CREATE TABLE atlas_queue(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,source_id TEXT,url TEXT,domain TEXT,category TEXT,depth INTEGER,parent_url TEXT,status TEXT,created_at TEXT,next_attempt_at INTEGER NOT NULL DEFAULT 0,fetch_state TEXT,UNIQUE(user_id,job_id,url));
     CREATE TABLE atlas_events(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,time TEXT,level TEXT,message TEXT,url TEXT);
     CREATE TABLE atlas_edges(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,source TEXT,target TEXT,UNIQUE(user_id,job_id,source,target));
     CREATE TABLE atlas_bookmarks(user_id TEXT,resource_id TEXT,UNIQUE(user_id,resource_id));
@@ -473,8 +473,8 @@ test("Historical run graph loads outside the dashboard frontier window and enfor
     for(let i=0;i<4;i++)insertJob.run(`new-run-${i}`,`2026-01-0${i+1}`);
     sqlite.exec(`
       INSERT INTO atlas_pages VALUES('old-page','alice','old-run','source','https://research.org/old','Older research','Summary','Finance','Research','[]',0,NULL,'2020-01-01','indexed');
-      INSERT INTO atlas_queue VALUES('old-root','alice','old-run','source','https://research.org/old','Finance','Research',0,NULL,'done','2020-01-01');
-      INSERT INTO atlas_queue VALUES('old-child','alice','old-run','source','https://research.org/child','Finance','Research',1,'https://research.org/old','skipped','2020-01-01');
+      INSERT INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,parent_url,status,created_at) VALUES('old-root','alice','old-run','source','https://research.org/old','Finance','Research',0,NULL,'done','2020-01-01');
+      INSERT INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,parent_url,status,created_at) VALUES('old-child','alice','old-run','source','https://research.org/child','Finance','Research',1,'https://research.org/old','skipped','2020-01-01');
       INSERT INTO atlas_edges VALUES('old-edge','alice','old-run','https://research.org/old','https://research.org/child');
       INSERT INTO atlas_events VALUES('old-event','alice','old-run','2020-01-01','info','Completed',NULL);
     `);
@@ -563,7 +563,7 @@ test("Extensive discovery stops at ten thousand saved queue entries while run sn
   globalThis.fetch=(async()=>new Response('<title>Bank merger evidence</title><p>Bank mergers change operating costs and competition among financial institutions.</p><a href="/new-1">Bank merger one</a><a href="/new-2">Bank merger two</a><a href="/new-3">Bank merger three</a>',{headers:{"content-type":"text/html"}})) as typeof fetch;
   try{
     const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/article"],preset:"extensive"},[]),id=String(created.job.id);
-    const queue=sqlite.prepare("INSERT INTO atlas_queue VALUES(?,'alice',?,'seed',?,'Finance','Research',1,'https://publicresearch.org/article','done','2026-01-01')");
+    const queue=sqlite.prepare("INSERT INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,parent_url,status,created_at) VALUES(?,'alice',?,'seed',?,'Finance','Research',1,'https://publicresearch.org/article','done','2026-01-01')");
     for(let i=0;i<CRAWL_LIMITS.maxQueue-2;i++)queue.run(`old-${i}`,id,`https://publicresearch.org/old-${i}`);
     await stepJob(db,"alice",id);
     assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM atlas_queue WHERE job_id=?").get(id)?.n,10_000);
@@ -590,4 +590,85 @@ test("Bounded graph snapshots prioritize a running crawl over older completed ed
     const state=await readState(db,"alice");assert.equal(state.edges.length,3000);assert.equal(state.edges[0].jobId,"active");assert.equal(state.counts.edges,3011);assert.equal(state.truncated.edges,true);
     assert.deepEqual((await readState(db,"bob")).edges,[]);
   }finally{sqlite.close();}
+});
+
+test("Delayed redirects resume at the destination while other sources make progress",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch,originalNow=Date.now;
+  let clock=originalNow();Date.now=()=>clock;
+  cacheRobots("publicresearch.org");cacheRobots("otherresearch.org");
+  sqlite.exec("UPDATE atlas_hosts SET crawl_delay=10000 WHERE host='publicresearch.org'");
+  const requests:string[]=[];
+  globalThis.fetch=(async(input:RequestInfo|URL)=>{
+    const url=String(input);requests.push(url);
+    if(url.endsWith('/original'))return new Response(null,{status:302,headers:{location:'/article'}});
+    return new Response('<title>Bank merger outcomes</title><p>This study examines bank merger performance and lending outcomes across financial institutions.</p>',{headers:{'content-type':'text/html'}});
+  }) as typeof fetch;
+  try{
+    const created=await createJob(db,'alice',{query:'bank mergers',urls:['https://publicresearch.org/original'],maxDepth:0,scope:'linked-domains'},[]),id=String(created.job.id);
+    const first=await stepJob(db,'alice',id,[]);
+    assert.equal(first.waiting,true);assert.equal(first.job.processed,0);
+    const queued=sqlite.prepare("SELECT * FROM atlas_queue WHERE job_id=?").get(id)!;
+    assert.equal(JSON.parse(String(queued.fetch_state)).document.url,'https://publicresearch.org/article');
+    assert.equal(queued.next_attempt_at,clock+10000);
+    // Add a ready URL after the deferred item, proving the first item cannot starve it.
+    sqlite.prepare("INSERT INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,status,created_at) VALUES('ready','alice',?,'source','https://otherresearch.org/article','Finance','Research',1,'queued','2099-01-01')").run(id);
+    const other=await stepJob(db,'alice',id,[]);assert.equal(other.job.processed,1);
+    const eventCount=sqlite.prepare('SELECT count(*) AS n FROM atlas_events').get()!.n;
+    const waiting=await stepJob(db,'alice',id,[]);assert.equal(waiting.waiting,true);assert.equal(waiting.job.status,'running');assert.equal(waiting.retryAt,clock+10000);
+    assert.equal(sqlite.prepare('SELECT count(*) AS n FROM atlas_events').get()!.n,eventCount,'Polling a deferred queue must not spam events or make requests');
+    clock+=10001;
+    const last=await stepJob(db,'alice',id,[]);assert.equal(last.job.processed,2);assert.equal(last.job.status,'completed');
+    assert.deepEqual(requests,['https://publicresearch.org/original','https://otherresearch.org/article','https://publicresearch.org/article']);
+    assert.equal(last.job.indexed,2);
+  }finally{globalThis.fetch=originalFetch;Date.now=originalNow;sqlite.close();}
+});
+
+test("Robots redirects and long crawl delays survive separate step requests",async()=>{
+  const {db,sqlite}=testDatabase(),originalFetch=globalThis.fetch,originalNow=Date.now;
+  let clock=originalNow();Date.now=()=>clock;
+  const requests:string[]=[];
+  globalThis.fetch=(async(input:RequestInfo|URL)=>{
+    const url=String(input);requests.push(url);
+    if(url.endsWith('/robots.txt')){
+      sqlite.prepare('UPDATE atlas_hosts SET next_allowed_at=?,crawl_delay=10000').run(clock+10000);
+      return new Response(null,{status:302,headers:{location:'/robots-policy'}});
+    }
+    if(url.endsWith('/robots-policy'))return new Response('User-agent: *\nCrawl-delay: 10\nDisallow: /private',{headers:{'content-type':'text/plain'}});
+    return new Response('<title>Bank mergers and lending</title><p>Research on bank merger performance and the effects of consolidation on lending outcomes.</p>',{headers:{'content-type':'text/html'}});
+  }) as typeof fetch;
+  try{
+    const created=await createJob(db,'alice',{query:'bank mergers',urls:['https://publicresearch.org/article'],maxDepth:0},[]),id=String(created.job.id);
+    assert.equal((await stepJob(db,'alice',id,[])).waiting,true);
+    const saved=JSON.parse(String(sqlite.prepare('SELECT fetch_state FROM atlas_queue').get()!.fetch_state));
+    assert.equal(saved.robots.url,'https://publicresearch.org/robots-policy');assert.equal(saved.robots.redirects,1);
+    clock+=10001;assert.equal((await stepJob(db,'alice',id,[])).waiting,true);
+    clock+=10001;const final=await stepJob(db,'alice',id,[]);assert.equal(final.job.processed,1);assert.equal(final.job.indexed,1);
+    assert.deepEqual(requests,['https://publicresearch.org/robots.txt','https://publicresearch.org/robots-policy','https://publicresearch.org/article']);
+  }finally{globalThis.fetch=originalFetch;Date.now=originalNow;sqlite.close();}
+});
+
+test("Redirect budget cannot reset across delayed retries",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch,originalNow=Date.now;
+  let clock=originalNow();Date.now=()=>clock;cacheRobots('publicresearch.org');sqlite.exec('UPDATE atlas_hosts SET crawl_delay=10000');
+  const requests:string[]=[];
+  globalThis.fetch=(async(input:RequestInfo|URL)=>{const url=String(input);requests.push(url);return new Response(null,{status:302,headers:{location:url+'/next'}})}) as typeof fetch;
+  try{
+    const created=await createJob(db,'alice',{urls:['https://publicresearch.org/start'],maxDepth:0},[]),id=String(created.job.id);
+    for(let i=0;i<3;i++){assert.equal((await stepJob(db,'alice',id,[])).waiting,true);clock+=10001;}
+    const final=await stepJob(db,'alice',id,[]);assert.equal(final.job.processed,1);assert.equal(final.job.status,'completed');assert.equal(requests.length,4);
+    assert.ok((await readState(db,'alice')).events.some(event=>event.message==='Redirect limit reached.'));
+  }finally{globalThis.fetch=originalFetch;Date.now=originalNow;sqlite.close();}
+});
+
+test("Eligible URLs are selected beyond the deferred candidate window",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;
+  cacheRobots('publicresearch.org');let fetched=0;
+  globalThis.fetch=(async()=>{fetched++;return new Response('<title>Research article</title><p>A detailed research report with public methodology and supporting evidence.</p>',{headers:{'content-type':'text/html'}})}) as typeof fetch;
+  try{
+    const created=await createJob(db,'alice',{urls:['https://publicresearch.org/article'],maxDepth:0},[]),id=String(created.job.id);
+    sqlite.exec("UPDATE atlas_queue SET created_at='2099-01-01'");
+    const insert=sqlite.prepare("INSERT INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,status,created_at,next_attempt_at) VALUES(?,'alice',?,'source',?,'Finance','Research',0,'queued','2000-01-01',?)");
+    for(let i=0;i<130;i++)insert.run(`delayed-${i}`,id,`https://publicresearch.org/delayed-${i}`,Date.now()+60000);
+    const result=await stepJob(db,'alice',id,[]);assert.equal(result.job.processed,1);assert.equal(fetched,1);assert.equal(result.job.queued,130);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
 });

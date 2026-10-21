@@ -12,6 +12,7 @@ type DashboardProps={
  job?:DashboardJob|null;events:CrawlEvent[];currentUrl:string;fetching:boolean;replay:boolean;
  discovered:number;telemetryError?:boolean;pages?:MetricInput['pages'];frontier?:MetricInput['frontier'];
  edges?:Array<{source:string;target:string}>;query?:string;now?:number;snapshotLimited?:boolean;
+ scheduling?:{pending:number;deferred:number;nextAttemptAt:number|null};
 };
 const EMPTY:never[]=[];
 const ACCENTS=['#65f5b6','#57d9ff','#fa79d9','#edf47a','#ffad78','#b1a1ff'];
@@ -36,7 +37,7 @@ function Sparkline({values,color,label,fixedMax}:{values:number[];color:string;l
  </svg>;
 }
 
-export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError,pages=EMPTY,frontier=EMPTY,edges=EMPTY,query='',now,snapshotLimited=false}:DashboardProps){
+export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError,pages=EMPTY,frontier=EMPTY,edges=EMPTY,query='',now,snapshotLimited=false,scheduling}:DashboardProps){
  const [clock,setClock]=useState(Date.now());
  const live=job?.status==='running'&&!replay;
  useEffect(()=>{if(!live)return;setClock(Date.now());const timer=setInterval(()=>setClock(Date.now()),1000);return()=>clearInterval(timer)},[live,job?.id]);
@@ -65,7 +66,10 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
  const budget=job?.maxPages?Math.min(100,Math.max(0,(job.processed||0)/job.maxPages*100)):0;
  const sampled=snapshotLimited||metrics.limited;
  const endReason=job?.status==='completed'?([...orderedEvents].reverse().find(event=>/page limit|queue exhausted|complete|no .*URLs/i.test(event.message))?.message.replace(/^Stage · complete · /,'')):undefined;
- const runHint=replay?'Recorded activity: use the timeline to inspect this crawl.':job?.status==='paused'?'Queue saved. Resume this crawl when you are ready.':job?.status==='completed'?endReason||'This crawl has finished. Review the saved pages in Research results.':live?fetching?'Fetching the current destination, then checking relevance and access.':'Waiting for the next queued request. Keep the workspace open to continue.':'Choose a research objective and starting documents to begin.';
+ const allDeferred=Boolean(scheduling?.pending&&scheduling.deferred===scheduling.pending);
+ const waitSeconds=Math.max(0,Math.ceil(((scheduling?.nextAttemptAt||0)-(now??clock))/1000));
+ const queueHint=allDeferred?`Sources require a crawl delay. Next retry ${waitSeconds?`in ${waitSeconds}s`:'is ready'}. Your queue is saved.`:scheduling?.deferred?`${scheduling.deferred} URLs are waiting for their source’s crawl delay. Continuing with other ready URLs.`:'Checking the next queued URL. Keep the workspace open to continue.';
+ const runHint=replay?'Recorded activity: use the timeline to inspect this crawl.':job?.status==='paused'?'Queue saved. Resume this crawl when you are ready.':job?.status==='completed'?endReason||'This crawl has finished. Review the saved pages in Research results.':live?fetching?'Fetching the current destination, then checking relevance and access.':queueHint:'Choose a research objective and starting documents to begin.';
  return <div className="crawl-telemetry"><section className="crawl-run-overview" aria-label="Crawl progress overview"><div><span className="eyebrow">{replay?'Recorded crawl':live?'Live crawl':job?'Crawl summary':'Crawl dashboard'}</span><p>{runHint}</p></div><dl><div><dt>Pages checked</dt><dd>{number(processed)}<small> / {number(job?.maxPages)}</small></dd></div><div><dt>Pages saved</dt><dd>{job?number(job.indexed??pages.length):'—'}</dd></div><div><dt>Queue remaining</dt><dd>{number(queued)}</dd></div><div><dt>Depth limit</dt><dd>{job?number(job.maxDepth):'—'}<small> links</small></dd></div></dl>{sampled&&<p className="crawl-sample-note">{replay?'Replay reflects the recorded pages available in this view.':'Run totals above are exact.'} Network and website charts use a bounded view; metadata charts cover {metrics.pagesAnalyzed.toLocaleString()} loaded pages. All saved pages remain in Results and Export.</p>}</section><section className="crawl-dashboard" aria-label="Crawl telemetry">
   <section className="telemetry-panel telemetry-log" aria-label="Crawl log" style={accent(ACCENTS[0])}>
    <header className="telemetry-heading"><h2>Crawl log</h2><span title="Events loaded for this view">{number(logCount)}{job?' events':''}</span></header>

@@ -8,17 +8,17 @@ function database(){
   const sqlite=new DatabaseSync(":memory:");
   sqlite.exec(`CREATE TABLE atlas_jobs(id TEXT PRIMARY KEY,user_id TEXT,status TEXT,processed INTEGER,indexed INTEGER,errors INTEGER,max_pages INTEGER,max_depth INTEGER,created_at TEXT,updated_at TEXT);
     CREATE TABLE atlas_events(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,time TEXT,level TEXT,message TEXT,url TEXT);
-    CREATE TABLE atlas_queue(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,url TEXT,status TEXT,depth INTEGER);
+    CREATE TABLE atlas_queue(id TEXT PRIMARY KEY,user_id TEXT,job_id TEXT,url TEXT,status TEXT,depth INTEGER,next_attempt_at INTEGER NOT NULL DEFAULT 0,fetch_state TEXT);
     INSERT INTO atlas_jobs VALUES('alice-run','alice','running',4,2,1,20,2,'2026-10-21','2026-10-21');
     INSERT INTO atlas_jobs VALUES('bob-run','bob','running',9,7,1,30,3,'2026-10-21','2026-10-21');
     INSERT INTO atlas_events VALUES('alice-event','alice','alice-run','2026-10-21T10:00:00Z','info','Fetching public research','https://public.org/article');
     INSERT INTO atlas_events VALUES('bob-event','bob','bob-run','2026-10-21T10:00:00Z','info','Secret research','https://private.org/secret');
     INSERT INTO atlas_events VALUES('mismatched-event','bob','alice-run','2026-10-21T11:00:00Z','info','Secret mismatched event','https://private.org/mismatch');
-    INSERT INTO atlas_queue VALUES('active','alice','alice-run','https://public.org/article','processing',1);
-    INSERT INTO atlas_queue VALUES('pending','alice','alice-run','https://public.org/next','queued',2);
-    INSERT INTO atlas_queue VALUES('done','alice','alice-run','https://public.org/start','done',0);
-    INSERT INTO atlas_queue VALUES('secret-active','bob','bob-run','https://private.org/secret','processing',0);
-    INSERT INTO atlas_queue VALUES('mismatched-active','bob','alice-run','https://private.org/mismatch','processing',1);`);
+    INSERT INTO atlas_queue(id,user_id,job_id,url,status,depth) VALUES('active','alice','alice-run','https://public.org/article','processing',1);
+    INSERT INTO atlas_queue(id,user_id,job_id,url,status,depth) VALUES('pending','alice','alice-run','https://public.org/next','queued',2);
+    INSERT INTO atlas_queue(id,user_id,job_id,url,status,depth) VALUES('done','alice','alice-run','https://public.org/start','done',0);
+    INSERT INTO atlas_queue(id,user_id,job_id,url,status,depth) VALUES('secret-active','bob','bob-run','https://private.org/secret','processing',0);
+    INSERT INTO atlas_queue(id,user_id,job_id,url,status,depth) VALUES('mismatched-active','bob','alice-run','https://private.org/mismatch','processing',1);`);
   let batches=0;
   class Prepared{
     sql:string;params:(string|number|null)[];
@@ -58,5 +58,18 @@ test("Telemetry returns the newest 80 events and clears the current URL once pro
     assert.equal(result.events.length,80);assert.equal(result.events[0].id,"event-099");assert.equal(result.events[79].id,"event-020");
     assert.equal(result.current,null);assert.deepEqual(Object.fromEntries(result.queue.map(row=>[row.status,row.count])),{done:2,queued:1});
     assert.equal(await readTelemetry(db,"alice","missing-run"),null);
+  }finally{sqlite.close()}
+});
+
+test("Telemetry reports owner-scoped deferred URLs and the resumed destination",async()=>{
+  const {sqlite,db}=database();
+  try{
+    const retryAt=Date.now()+60000;
+    sqlite.prepare("UPDATE atlas_queue SET next_attempt_at=? WHERE id='pending'").run(retryAt);
+    sqlite.prepare("UPDATE atlas_queue SET fetch_state=? WHERE id='active'").run(JSON.stringify({document:{url:'https://public.org/redirected',redirects:1}}));
+    sqlite.exec("UPDATE atlas_queue SET status='queued',next_attempt_at=9999999999999 WHERE user_id='bob'");
+    const result=await readTelemetry(db,'alice','alice-run');assert.ok(result);
+    assert.equal(result.current?.url,'https://public.org/redirected');
+    assert.deepEqual({...result.scheduling},{pending:1,deferred:1,nextAttemptAt:retryAt});
   }finally{sqlite.close()}
 });
