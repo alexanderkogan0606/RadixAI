@@ -72,3 +72,5 @@ Applied the user's [Uiverse library](https://uiverse.io/elements) to the real lo
 ### Supervised crawl telemetry
 
 The six-panel strip follows the supplied X video frames: Crawl Log, Sections, Coverage Radar, Word Heat, Spec Score, and Crawler.ts. Charts derive from captured metadata, queue state, and HTTP events; no simulated counters or code typing. The last panel exposes the backend Chief of Staff decision and all four agent verdicts. A separate eight-stage strip advances only when the backend emits a phase. Color is paired with text labels, charts have accessible descriptions, and six columns wrap to three, two, and one across narrower viewports. Metadata analysis is memoized separately from the elapsed clock; SVGs and visible logs are bounded.
+
+Chart labels occupy reserved space outside the data marks: radar terms have outer gutters and the gauge caption sits below its arc. Panel columns wrap according to available container width, with readable minimum widths; timer labels stack instead of squeezing beside long durations.

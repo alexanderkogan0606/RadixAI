@@ -55,13 +55,13 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
  const isRecorded=replay||Boolean(job&&job.status!=='running');
  const score=metrics.metadataMatch;
  const radarRows=metrics.pagesAnalyzed?metrics.termRows:[],radarCount=radarRows.length;
- const radarPoint=(i:number,radius:number)=>{const angle=-Math.PI/2+i*Math.PI*2/Math.max(1,radarCount);return [100+Math.cos(angle)*radius,78+Math.sin(angle)*radius]};
+ const radarPoint=(i:number,radius:number)=>{const angle=-Math.PI/2+i*Math.PI*2/Math.max(1,radarCount);return [120+Math.cos(angle)*radius,86+Math.sin(angle)*radius]};
  const radarPolygon=(radius:number)=>radarRows.map((_,i)=>radarPoint(i,radius).join(',')).join(' ');
  const circumference=2*Math.PI*47;
  const logCount=job?events.length:null;
  const processed=job?job.processed??0:null,queued=job?job.queued??0:null,errors=job?job.errors??0:null;
  const budget=job?.maxPages?Math.min(100,Math.max(0,(job.processed||0)/job.maxPages*100)):0;
- return <section className="crawl-dashboard" aria-label="Crawl telemetry">
+ return <div className="crawl-telemetry"><section className="crawl-dashboard" aria-label="Crawl telemetry">
   <section className="telemetry-panel telemetry-log" aria-label="Crawl log" style={accent(ACCENTS[0])}>
    <header className="telemetry-heading"><h2>Crawl log</h2><span title="Events loaded for this view">{number(logCount)}{job?' events':''}</span></header>
    <ol className="telemetry-event-list" aria-label="Latest recorded crawl events">
@@ -89,12 +89,12 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
 
   <section className="telemetry-panel telemetry-coverage" aria-label="Coverage radar" style={accent(ACCENTS[0])}>
    <header className="telemetry-heading"><h2>Coverage radar</h2><span>{metrics.pagesAnalyzed?`${metrics.pagesAnalyzed} pages`:'—'}</span></header>
-   <svg className="telemetry-radar" viewBox="0 0 200 157" role="img" aria-label={radarRows.length?`Captured metadata coverage: ${radarRows.map(row=>`${row.term} in ${Math.round(row.sharePercent)} percent of pages`).join('; ')}.`:'No captured metadata to chart.'}>
-    {radarCount>=3?[20,40,60].map(radius=><polygon key={radius} points={radarPolygon(radius)} className="telemetry-radar-grid"/>):[20,40,60].map(radius=><circle key={radius} cx="100" cy="78" r={radius} className="telemetry-radar-grid"/>)}
-    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,60),[lx,ly]=radarPoint(i,74);return <g key={row.term}><path d={`M100 78L${x} ${y}`} className="telemetry-radar-grid"/><text x={Math.max(28,Math.min(172,lx))} y={ly+3} textAnchor="middle" fill={colorFor(row.term)}>{row.term.length>7?`${row.term.slice(0,6)}…`:row.term}<title>{row.term}: {Math.round(row.sharePercent)}% of captured metadata</title></text></g>})}
-    {radarCount>=3&&<polygon points={radarRows.map((row,i)=>radarPoint(i,60*row.sharePercent/100).join(',')).join(' ')} className="telemetry-radar-value"/>}
-    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,60*row.sharePercent/100);return <g key={row.term}>{radarCount<3&&<path d={`M100 78L${x} ${y}`} stroke={colorFor(row.term)} strokeWidth="2"/>}<circle cx={x} cy={y} r="2.3" fill={colorFor(row.term)}/></g>})}
-    {!radarCount&&<text x="100" y="83" textAnchor="middle" className="telemetry-empty-mark">—</text>}
+   <svg className="telemetry-radar" viewBox="0 0 240 172" role="img" aria-label={radarRows.length?`Captured metadata coverage: ${radarRows.map(row=>`${row.term} in ${Math.round(row.sharePercent)} percent of pages`).join('; ')}.`:'No captured metadata to chart.'}>
+    {radarCount>=3?[16,33,49].map(radius=><polygon key={radius} points={radarPolygon(radius)} className="telemetry-radar-grid"/>):[16,33,49].map(radius=><circle key={radius} cx="120" cy="86" r={radius} className="telemetry-radar-grid"/>)}
+    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,49),[lx,ly]=radarPoint(i,67);return <g key={row.term}><path d={`M120 86L${x} ${y}`} className="telemetry-radar-grid"/><text x={lx} y={ly+4} textAnchor={lx<100?'end':lx>140?'start':'middle'} fill={colorFor(row.term)}>{row.term.length>6?`${row.term.slice(0,5)}…`:row.term}<title>{row.term}: {Math.round(row.sharePercent)}% of captured metadata</title></text></g>})}
+    {radarCount>=3&&<polygon points={radarRows.map((row,i)=>radarPoint(i,49*row.sharePercent/100).join(',')).join(' ')} className="telemetry-radar-value"/>}
+    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,49*row.sharePercent/100);return <g key={row.term}>{radarCount<3&&<path d={`M120 86L${x} ${y}`} stroke={colorFor(row.term)} strokeWidth="2"/>}<circle cx={x} cy={y} r="2.3" fill={colorFor(row.term)}/></g>})}
+    {!radarCount&&<text x="120" y="91" textAnchor="middle" className="telemetry-empty-mark">—</text>}
    </svg>
    <p className="telemetry-note">Share of titles + summaries containing each term.</p>
    <footer className="telemetry-footer"><span>{radarRows.some(row=>row.origin==='query')?'Query + metadata terms':'Metadata terms'}</span><b>0–100%</b></footer>
@@ -119,9 +119,10 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
    <svg className="telemetry-gauge" viewBox="0 0 160 127" role="img" aria-label={score===null?'Metadata match unavailable until query terms and captured pages exist.':`Metadata match ${Math.round(score)} percent. Mean query term coverage in captured page titles and summaries; this does not measure source quality.`}>
     <circle cx="80" cy="63" r="47" fill="none" stroke="#33352a" strokeWidth="7" strokeDasharray={`${circumference*.75} ${circumference*.25}`} strokeLinecap="round" transform="rotate(135 80 63)"/>
     {score!==null&&score>0&&<circle cx="80" cy="63" r="47" fill="none" stroke={ACCENTS[3]} strokeWidth="7" strokeDasharray={`${circumference*.75*score/100} ${circumference}`} strokeLinecap="round" transform="rotate(135 80 63)"/>}
-    <text x="80" y="69" textAnchor="middle" className="telemetry-score-value">{score===null?'—':Math.round(score)}</text><text x="80" y="88" textAnchor="middle" className="telemetry-score-caption">metadata match</text>
+    <text x="80" y="70" textAnchor="middle" className="telemetry-score-value">{score===null?'—':Math.round(score)}</text>
     <text x="42" y="116" textAnchor="middle" className="telemetry-gauge-tick">0</text><text x="119" y="116" textAnchor="middle" className="telemetry-gauge-tick">100</text>
    </svg>
+   <p className="telemetry-score-caption">metadata match</p>
    <p className="telemetry-note">Mean query-term coverage.<br/>Based on titles + summaries.</p>
   </section>
 
@@ -138,5 +139,5 @@ export default function CrawlDashboard({job,events,currentUrl,fetching,replay,di
    <Sparkline values={metrics.fetchSamples.map(sample=>sample.durationMs)} color={ACCENTS[1]} label={metrics.fetchSamples.length?`Last ${metrics.fetchSamples.length} HTTP response durations; latest ${metrics.latestFetchMs} milliseconds.`:'No HTTP timing samples yet.'}/>
    <footer className="telemetry-footer"><span>{metrics.fetchSamples.length?`${metrics.fetchSamples.length} responses`:'No responses yet'}</span><b>{metrics.averageFetchMs!==null?`${number(metrics.averageFetchMs)} ms avg`:'—'}</b></footer>
   </section>
- </section>;
+ </section></div>;
 }
