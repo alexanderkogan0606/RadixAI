@@ -1,6 +1,10 @@
 # RadixAI — Research Crawler
 
-A private research workspace for finance, business, technology, and case studies. It combines a conversational source finder, interactive network graph, persistent crawler, and an exportable source database.
+An open-source research workspace for finance, business, technology, and case studies, with private research collections for each signed-in user. It combines a conversational source finder, interactive network graph, persistent crawler, and an exportable source database.
+
+[Try RadixAI](https://radixai.sk1616.chatgpt.site/) · [Source code](https://github.com/alexanderkogan0606/RadixAI) · [MIT license](LICENSE)
+
+The hosted app is shareable by link. Sign in with ChatGPT to create and save your own research; other visitors cannot access your private crawls or chat history.
 
 ## What is included
 
@@ -20,15 +24,18 @@ A private research workspace for finance, business, technology, and case studies
 Requires Node.js 22.13+ and npm. Node 24+ is recommended for the SQLite-backed integration tests.
 
 ```sh
+git clone https://github.com/alexanderkogan0606/RadixAI.git
+cd RadixAI
 npm ci
 npm run db:generate # only after a schema change; initial migrations are already committed
 npm run build
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_blue_justice.sql
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_discovered_documents.sql
+node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0002_crawl_resume.sql
 npm run dev
 ```
 
-Open the printed localhost URL. The local preview uses a loopback-only development user and local D1 storage. The hosted private application uses the authenticated Sites user. Keep production behind the Sites access boundary; do not expose a standalone deployment that blindly trusts externally supplied identity headers.
+Open the printed localhost URL. The local preview uses a loopback-only development user and local D1 storage. The hosted application uses the authenticated Sites user. Keep production behind the Sites access boundary; do not expose a standalone deployment that blindly trusts externally supplied identity headers.
 
 For subsequent schema changes, generate and apply each **new** migration in order. Do not replay previously applied SQL. Hosted Sites applies committed schema migrations during deployment.
 
@@ -94,3 +101,9 @@ This repository contains code and public source-catalog metadata. Private crawl 
 
 Interface rationale and the primary UI design skills applied are documented in [docs/interface-design.md](docs/interface-design.md).
 The adapted Uiverse buttons, dot pattern, and loading indicator are credited with their MIT notices in [docs/uiverse-attribution.md](docs/uiverse-attribution.md).
+
+## License and contributions
+
+RadixAI is available under the [MIT License](LICENSE). You may use, modify, fork, and redistribute the code subject to that license. Contributions and issue reports are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Third-party components retain their original license and copyright notices, including [Sites build tooling](build/sites-vite-plugin.LICENSE), [shadcn styles](vendor/shadcn-tailwind-4.13.0.LICENSE.md), and the [Uiverse adaptations](docs/uiverse-attribution.md). Research articles, reports, and other linked content remain subject to their publishers’ terms; the code license does not relicense that material.
