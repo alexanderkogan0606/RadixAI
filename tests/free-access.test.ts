@@ -30,6 +30,15 @@ test("Query-scoped resources do not grant unrelated access and restricted ties w
   for(const sources of [[{url:"https://research.org/",access:"Free"},{url:"https://www.research.org/",access:"Mixed"}],[{url:"https://www.research.org/",access:"Mixed"},{url:"https://research.org/",access:"Free"}]])assert.equal(classifyPageAccess({url:"https://research.org/article"},sources),"Mixed");
 });
 
+test("Verified open documents override broad publisher access only at their exact URL and query",()=>{
+  const sources=[{url:"https://publisher.org/",access:"Mixed"},{url:"https://publisher.org/article?id=42",access:"Free",exact:true}];
+  assert.equal(classifyPageAccess({url:"https://publisher.org/article?id=42"},sources),"Free");
+  for(const url of ["https://publisher.org/article?id=43","https://publisher.org/article?id=42&edition=premium","https://publisher.org/article/appendix?id=42","https://publisher.org/unrelated"]){assert.equal(classifyPageAccess({url},sources),"Mixed",url)}
+  assert.equal(classifyPageAccess({url:"https://publisher.org/article?id=42#abstract"},sources),"Free");
+  const reordered=[{url:"https://publisher.org/article?b=2&a=1",access:"Free",exact:true}];
+  assert.equal(classifyPageAccess({url:"https://publisher.org/article?a=1&b=2"},reordered),"Free");
+});
+
 test("Explicit structured-data, payment and sign-in gates are detected",()=>{
   for(const body of [
     `<script type="application/ld+json">{"@type":"NewsArticle","isAccessibleForFree":false}</script>`,

@@ -1,0 +1,100 @@
+/*!
+ * Uiverse MIT adaptations, inspected 2026-10-21:
+ * cssbuttons-io/evil-monkey-41; kennyotsu/short-warthog-33;
+ * satyamchaudharydev/ugly-bulldog-75.
+ * Copyright - 2026 cssbuttons-io (cssbuttons.io)
+ * Copyright - 2026 kennyotsu (kotsu)
+ * Copyright - 2026 satyamchaudharydev (satyam)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ * Author links and original excerpts: docs/uiverse-attribution.md.
+ */
+
+/* A small, tactile transform follows cssbuttons-io's raised-front interaction.
+   Existing semantic colors and dimensions remain owned by each component. */
+.button,.research-send{
+ transform:translateY(0);
+ transition:transform 170ms cubic-bezier(.3,.7,.4,1);
+ touch-action:manipulation;
+}
+@media(hover:hover) and (pointer:fine){
+ .button:not(:disabled):not([aria-disabled="true"]):not([aria-busy="true"]):hover,
+ .research-send:not(:disabled):not([aria-busy="true"]):hover{transform:translateY(-1px)}
+}
+.button:not(:disabled):not([aria-disabled="true"]):not([aria-busy="true"]):active,
+.research-send:not(:disabled):not([aria-busy="true"]):active{
+ transform:translateY(1px);
+ transition-duration:45ms;
+}
+.button:focus-visible,.research-send:focus-visible{outline:2px solid var(--text,#ececea);outline-offset:3px}
+.button:disabled,.button[aria-disabled="true"],.button[aria-busy="true"],.research-send:disabled{transform:none}
+
+/* kennyotsu's radial-dot pattern, scaled down and made quieter for small surfaces.
+   Static paint only: no animation, filters, fixed layers or full-page overlays. */
+.atlas-dot-surface{
+ background-color:var(--surface,#161616);
+ background-image:radial-gradient(rgba(230,230,222,.075) .8px,transparent .9px);
+ background-size:20px 20px;
+ background-position:-5px -5px;
+}
+.loading-state{
+ display:flex;
+ flex-direction:column;
+ align-items:center;
+ justify-content:center;
+ gap:13px;
+ width:100%;
+ min-height:180px;
+ padding:32px 20px;
+ border:1px solid var(--line,#2b2b2b);
+ border-radius:6px;
+ color:var(--muted,#989895);
+}
+.loading-state .loading-state-label{font-size:12px;line-height:1.7;text-align:center;max-width:440px;margin:0;color:inherit}
+.loading-state-compact{
+ display:inline-flex;
+ flex-direction:row;
+ justify-content:flex-start;
+ width:auto;
+ min-height:24px;
+ gap:9px;
+ padding:0;
+ border:0;
+ background:none;
+}
+.loading-state-compact .loading-state-label{font-size:11px;text-align:left}
+
+/* Three small bars adapt satyamchaudharydev's staggered scaleY loader.
+   Only transform and opacity animate; no JavaScript timers or layout animation. */
+.loading-state .atlas-loading-bars{display:inline-flex;align-items:center;justify-content:center;gap:4px;width:24px;height:18px;color:#a9b9b1;flex-shrink:0;margin:0}
+.loading-state .atlas-loading-bars>span{display:block;width:3px;height:12px;border-radius:3px;background:currentColor;color:inherit;margin:0;transform:scaleY(.35);opacity:.4;animation:atlas-loading-wave 1.15s ease-in-out infinite}
+.atlas-loading-bars>span:nth-child(2){animation-delay:-1s}
+.atlas-loading-bars>span:nth-child(3){animation-delay:-.85s}
+@keyframes atlas-loading-wave{
+ 0%,45%,100%{transform:scaleY(.35);opacity:.4}
+ 22%{transform:scaleY(1);opacity:1}
+}
+@media(prefers-reduced-motion:reduce){
+ .button,.research-send{transition:none!important;transform:none!important}
+ .loading-state .atlas-loading-bars>span{animation:none!important;transform:scaleY(.55);opacity:.8}
+ .loading-state .atlas-loading-bars>span:nth-child(2){transform:scaleY(1)}
+}
+@media(forced-colors:active){
+ .atlas-dot-surface{background-image:none}
+ .loading-state .atlas-loading-bars>span{background:CanvasText}
+ .button:focus-visible,.research-send:focus-visible{outline-color:Highlight}
+}

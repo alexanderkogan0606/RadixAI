@@ -62,6 +62,7 @@ function testDatabase(latencyMs=0) {
     CREATE TABLE atlas_bookmarks(user_id TEXT,resource_id TEXT,UNIQUE(user_id,resource_id));
     CREATE TABLE atlas_hosts(host TEXT PRIMARY KEY,next_allowed_at INTEGER DEFAULT 0,robots_text TEXT,robots_status INTEGER,robots_fetched_at INTEGER,crawl_delay INTEGER DEFAULT 1000);
     CREATE TABLE atlas_chat(id TEXT PRIMARY KEY,user_id TEXT,role TEXT,content TEXT,metadata TEXT DEFAULT '{}',created_at TEXT);
+    CREATE TABLE atlas_documents(id TEXT PRIMARY KEY,user_id TEXT,url TEXT,title TEXT,description TEXT,domain TEXT,document_type TEXT,provider TEXT,provider_id TEXT,provider_record_url TEXT,access_basis TEXT,full_text_url TEXT,doi TEXT,published_at TEXT,query TEXT,queries TEXT DEFAULT '[]',discovered_at TEXT,updated_at TEXT,UNIQUE(user_id,url));
   `);
   const metrics={calls:0,statements:0};
   let inBatch=false;
@@ -93,7 +94,7 @@ test("D1 integration: feed discovery, persistent queue, pause/resume, ownership,
   globalThis.fetch = (async(input:RequestInfo|URL)=>{
     const url=String(input);requested.push(url);
     if(url.includes("/rss"))return new Response(`<rss><channel><title>Research feed</title><item><title>A</title><link>https://publicresearch.org/a</link></item><item><title>Duplicate</title><link>https://publicresearch.org/a?utm_source=x</link></item><item><title>B</title><link>https://publicresearch.org/b</link></item></channel></rss>`,{headers:{"content-type":"application/rss+xml"}});
-    return new Response(`<title>Banking paper</title><meta name="description" content="Evidence on banking"><a href="/a">Self</a>`,{headers:{"content-type":"text/html"}});
+    return new Response(`<title>Banking paper</title><meta name="description" content="Evidence on banking competition and lending outcomes across several countries."><a href="/a">Self</a>`,{headers:{"content-type":"text/html"}});
   }) as typeof fetch;
   try {
     const created=await createJob(db,"alice",{query:"Banking",sourceIds:["feed"],maxPages:5,maxDepth:1,scope:"same-domain"},[{id:"feed",name:"Feed",url:"https://publicresearch.org/",feedUrl:"https://feeds.publicresearch.org/rss",domain:"Finance",category:"Academic research",access:"Free"}]);
@@ -101,7 +102,7 @@ test("D1 integration: feed discovery, persistent queue, pause/resume, ownership,
     assert.equal(created.job.queued,1);
     await assert.rejects(()=>stepJob(db,"bob",id),/not found/);
     const first=await stepJob(db,"alice",id);
-    assert.equal(first.job.indexed,1);
+    assert.equal(first.job.indexed,0,"A feed discovers articles but is not itself indexed research.");
     assert.equal(first.job.queued,2,"Feed and original source hosts must both remain in scope; duplicate URLs are removed.");
     await controlJob(db,"alice",id,"pause");
     assert.equal((await stepJob(db,"alice",id)).job.processed,1);
@@ -112,12 +113,12 @@ test("D1 integration: feed discovery, persistent queue, pause/resume, ownership,
     const last=await stepJob(db,"alice",id);
     assert.equal(last.job.status,"completed");
     assert.equal(last.job.processed,3);
-    assert.equal(last.job.indexed,2);
+    assert.equal(last.job.indexed,1);
     assert.equal(last.job.errors,1,"Robots-blocked URLs count in failed/blocked totals.");
     assert.equal(last.job.queued,0);
     assert.equal(requested.length,2,"A robots-blocked article must never be fetched.");
     const state=await readState(db,"alice");
-    assert.equal(state.pages.length,2);
+    assert.equal(state.pages.length,1);
     assert.equal(state.edges.length,2);
     assert.equal(state.frontier.length,3);
     assert.ok(state.frontier.some(item=>item.parentUrl === 'https://feeds.publicresearch.org/rss' && item.status === 'blocked'));
@@ -140,9 +141,9 @@ test("D1 integration: X-Robots-Tag nofollow prevents queue expansion and custom 
   const {db,sqlite,cacheRobots}=testDatabase();
   const originalFetch=globalThis.fetch;
   cacheRobots("publicresearch.org");
-  globalThis.fetch=(async()=>new Response(`<title>AI research</title><a href="/child">child</a>`,{headers:{"content-type":"text/html","x-robots-tag":"nofollow"}})) as typeof fetch;
+  globalThis.fetch=(async()=>new Response(`<title>AI research</title><p>Evidence on artificial intelligence evaluation and model deployment in production.</p><a href="/child">child</a>`,{headers:{"content-type":"text/html","x-robots-tag":"nofollow"}})) as typeof fetch;
   try {
-    const created=await createJob(db,"alice",{query:"AI research",urls:["https://publicresearch.org/"],maxPages:5,maxDepth:2},[]);
+    const created=await createJob(db,"alice",{query:"AI research",urls:["https://publicresearch.org/article"],maxPages:5,maxDepth:2},[]);
     const result=await stepJob(db,"alice",String(created.job.id));
     assert.equal(result.job.status,"completed");
     const state=await readState(db,"alice");
@@ -204,11 +205,81 @@ test("Crawler skips explicit paywalls before indexing or following their links",
 test("Public articles with newsletter subscriptions and ordinary sign-in links remain crawlable",async()=>{
   const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;
   cacheRobots("publicresearch.org");
-  globalThis.fetch=(async()=>new Response(`<h1>Open research</h1><p>A public report.</p><aside>Subscribe to our newsletter</aside><a href="/login">Sign in</a>`,{headers:{"content-type":"text/html"}})) as typeof fetch;
+  globalThis.fetch=(async()=>new Response(`<h1>Open research</h1><p>A public report comparing bank lending performance across several regions.</p><aside>Subscribe to our newsletter</aside><a href="/login">Sign in</a>`,{headers:{"content-type":"text/html"}})) as typeof fetch;
   try{
-    const created=await createJob(db,"alice",{urls:["https://publicresearch.org/"],maxDepth:0},[]);
+    const created=await createJob(db,"alice",{urls:["https://publicresearch.org/report"],maxDepth:0},[]);
     const result=await stepJob(db,"alice",String(created.job.id));
     assert.equal(result.job.indexed,1);assert.equal(result.job.errors,0);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Session-expiry captures are skipped without indexing or following account-page links",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publicresearch.org");
+  globalThis.fetch=(async()=>new Response(`<title>EMMA</title><p>Your session is about to expire due to inactivity.</p><a href="/bank-mergers">Bank mergers</a>`,{headers:{"content-type":"text/html"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"M&A banking",urls:["https://publicresearch.org/session-notice"],maxDepth:1},[]);
+    const result=await stepJob(db,"alice",String(created.job.id));
+    assert.equal(result.job.indexed,0);assert.equal(result.job.errors,1);
+    const state=await readState(db,"alice");assert.equal(state.pages.length,0);assert.equal(state.edges.length,0);
+    assert.ok(state.events.some(event=>String(event.message).startsWith("Fetching ")));
+    assert.ok(state.events.some(event=>/HTTP 200.*\d+ ms.*not indexed/.test(String(event.message))));
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Navigation discovers prioritized topical articles without indexing itself or footer links",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publicresearch.org");
+  const requested:string[]=[];
+  globalThis.fetch=(async(input:RequestInfo|URL)=>{
+    const url=String(input);requested.push(url);
+    return new Response(url.endsWith("/")?`<title>Research library</title><p>Browse our public research reports and updates.</p><a href="/office-updates">Office updates</a><a href="/login">Sign in</a><a href="/privacy">Privacy</a><a href="/bank-acquisition">Bank merger evidence</a>`:`<title>Bank acquisitions and lending</title><p>We compare lending and operating costs after bank mergers across several countries.</p>`,{headers:{"content-type":"text/html"}});
+  }) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"M&A banking",urls:["https://publicresearch.org/"],maxDepth:1},[]),id=String(created.job.id);
+    const first=await stepJob(db,"alice",id);assert.equal(first.job.indexed,0);assert.equal(first.job.processed,1);assert.equal(first.job.errors,0);
+    sqlite.exec("UPDATE atlas_hosts SET next_allowed_at=0");
+    const second=await stepJob(db,"alice",id);assert.equal(second.job.indexed,1);
+    assert.deepEqual(requested,["https://publicresearch.org/","https://publicresearch.org/bank-acquisition"]);
+    const state=await readState(db,"alice");assert.equal(state.pages.length,1);assert.equal(state.edges.length,2);
+    assert.ok(state.frontier.every(item=>!String(item.url).includes("login")&&!String(item.url).includes("privacy")));
+    assert.ok(state.events.some(event=>String(event.message).includes("Discovery only (navigation)")));
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Content extraction prefers article paragraphs over session notices and prioritizes anchor text",()=>{
+  const doc=`<title>Bank mergers and lending</title><p>Your session is about to expire due to inactivity.</p><main><p>Bank mergers change lending competition across regions and customer segments.</p><a href="/item?id=2">Office information</a><a href="/item?id=1">Bank acquisition evidence</a></main>`;
+  const extracted=extractDocument(doc,"https://research.org/article","text/html","bank mergers");
+  assert.match(extracted.description,/Bank mergers change lending/);
+  assert.equal(extracted.links[0],"https://research.org/item?id=1");
+});
+
+test("Verified open PDF seeds retain provider metadata and never claim PDF text extraction",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publisher.org");
+  const catalog=[{id:"publisher",name:"Publisher",url:"https://publisher.org/",domain:"Finance",access:"Mixed"},{id:"document",name:"Bank merger performance",url:"https://publisher.org/paper.pdf",description:"This study compares bank lending performance and operating costs after acquisitions.",domain:"Finance",access:"Free",exact:true}];
+  globalThis.fetch=(async()=>new Response("%PDF-1.7 unseen document bytes",{headers:{"content-type":"application/pdf"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",sourceIds:["document"],maxDepth:0},catalog);
+    const result=await stepJob(db,"alice",String(created.job.id),catalog);assert.equal(result.job.indexed,1);
+    const state=await readState(db,"alice");assert.equal(state.pages[0].title,"Bank merger performance");
+    assert.equal(state.pages[0].description,catalog[1].description);
+    assert.ok(state.events.some(event=>/PDF full text was not extracted/.test(String(event.message))));
+    assert.ok(!JSON.stringify(state).includes("unseen document bytes"));
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Oversized provider-backed HTML cancels its response and retains the metadata-only crawl limit",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("www.sec.gov");
+  const url="https://www.sec.gov/Archives/edgar/data/320193/000032019325000080/aapl-20250628.htm";
+  const catalog=[{id:"filing",name:"Apple Inc. quarterly report",url,description:"Apple filed its quarterly report on Form 10-Q with the Securities and Exchange Commission.",domain:"Finance",access:"Free",exact:true}];
+  let cancelled=false;
+  globalThis.fetch=(async()=>new Response(new ReadableStream({cancel(){cancelled=true;}}),{headers:{"content-type":"text/html","content-length":"1018325"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"Apple quarterly report",sourceIds:["filing"],maxDepth:0},catalog);
+    const result=await stepJob(db,"alice",String(created.job.id),catalog);
+    assert.equal(cancelled,true,"Rejecting the Content-Length header must also stop downloading the response.");
+    assert.equal(result.job.indexed,0);assert.equal(result.job.processed,1);
+    const state=await readState(db,"alice");assert.equal(state.pages.length,0);
+    assert.ok(state.events.some(event=>/1 MB metadata-fetch limit/.test(String(event.message))));
+    assert.equal(sqlite.prepare("SELECT status FROM atlas_queue WHERE job_id=?").get(String(created.job.id))?.status,"skipped");
   }finally{globalThis.fetch=originalFetch;sqlite.close();}
 });
 
@@ -221,13 +292,13 @@ test("Known paid redirect destinations and linked pages are never fetched",async
       const requested:string[]=[];
       globalThis.fetch=(async(input:RequestInfo|URL)=>{
         requested.push(String(input));
-        return redirect?new Response(null,{status:302,headers:{location:"https://paidresearch.org/article"}}):new Response(`<h1>Public study</h1><a href="https://paidresearch.org/article">Paid report</a>`,{headers:{"content-type":"text/html"}});
+        return redirect?new Response(null,{status:302,headers:{location:"https://paidresearch.org/article"}}):new Response(`<h1>Public study</h1><p>Evidence on bank lending outcomes and financial performance across regions.</p><a href="https://paidresearch.org/article">Paid report</a>`,{headers:{"content-type":"text/html"}});
       }) as typeof fetch;
       try{
-        const created=await createJob(db,"alice",{urls:["https://publicresearch.org/"],maxPages:5,maxDepth:1,scope:"linked-domains"},catalog);
+        const created=await createJob(db,"alice",{urls:["https://publicresearch.org/report"],maxPages:5,maxDepth:1,scope:"linked-domains"},catalog);
         await stepJob(db,"alice",String(created.job.id),catalog);
         if(!redirect)await stepJob(db,"alice",String(created.job.id),catalog);
-        assert.deepEqual(requested,["https://publicresearch.org/"]);
+        assert.deepEqual(requested,["https://publicresearch.org/report"]);
         const state=await readState(db,"alice");
         assert.equal(state.pages.length,redirect?0:1);
         assert.ok(state.events.some(event=>event.level==="skipped"&&/paid or mixed-access/.test(String(event.message))));
@@ -250,6 +321,9 @@ test("Full export crosses keyset batches, excludes other users, and counts and s
     for(let i=0;i<510;i++)eventInsert.run(`event-${i}`);
     const chatInsert=sqlite.prepare("INSERT INTO atlas_chat VALUES(?,'alice','user','hello','{}','2026-01-01')");
     for(let i=0;i<260;i++)chatInsert.run(`message-${i}`);
+    const documentInsert=sqlite.prepare("INSERT INTO atlas_documents(id,user_id,url,title,description,provider,query,queries) VALUES(?,?,?,'Provider title','Provider summary','OpenAlex','Bank mergers','[\"Bank mergers\"]')");
+    for(let i=0;i<255;i++)documentInsert.run(`document-${String(i).padStart(4,'0')}`,'alice',`https://papers.org/${i}`);
+    documentInsert.run('other-document','bob','https://papers.org/private');
     await setBookmark(db,'alice',{id:'page-0000',saved:true});
     await setBookmark(db,'alice',{id:'bob-secret-page',saved:true});
     const state=await readState(db,'alice');
@@ -270,6 +344,8 @@ test("Full export crosses keyset batches, excludes other users, and counts and s
     assert.equal(exported.events.length,510);
     assert.equal(exported.messages.length,260);
     assert.equal(exported.sources.length,252);
+    assert.equal(exported.documents.length,255);
+    assert.ok(!serialized.includes('https://papers.org/private'));
     assert.ok(!serialized.includes('"user_id"'));
     assert.ok(!serialized.includes('https://other.org/secret'));
     let onlyPages='';

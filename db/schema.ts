@@ -55,3 +55,15 @@ export const chat = sqliteTable("atlas_chat", {
   content: text("content").notNull(), metadata: text("metadata").notNull().default("{}"),
   createdAt: text("created_at").notNull(),
 }, t => [index("atlas_chat_user_created").on(t.userId,t.createdAt)]);
+
+// Provider-discovered documents are independent of crawl runs and retain query provenance.
+export const documents = sqliteTable("atlas_documents", {
+  id: text("id").primaryKey(), userId: text("user_id").notNull(), url: text("url").notNull(),
+  title: text("title").notNull(), description: text("description").notNull(),
+  domain: text("domain").notNull(), documentType: text("document_type").notNull(),
+  provider: text("provider").notNull(), providerId: text("provider_id").notNull(),
+  providerRecordUrl: text("provider_record_url").notNull(), accessBasis: text("access_basis").notNull(),
+  fullTextUrl: text("full_text_url"), doi: text("doi"), publishedAt: text("published_at"),
+  query: text("query").notNull(), queries: text("queries").notNull().default("[]"),
+  discoveredAt: text("discovered_at").notNull(), updatedAt: text("updated_at").notNull(),
+}, t => [uniqueIndex("atlas_documents_user_url").on(t.userId,t.url),index("atlas_documents_user_discovered").on(t.userId,t.discoveredAt)]);

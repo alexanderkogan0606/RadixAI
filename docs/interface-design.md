@@ -12,10 +12,10 @@ Signal's crawler is the primary workspace: a large, actual URL-link graph with a
 
 - Six core tokens: canvas #111111, surface #161616, raised #1c1c1c, border #2b2b2b, primary text #ececea, muted text #989895. Teal #9bddd0 is reserved for live activity, focus and key controls; the active node has a small soft halo. No colorful domain coding or decorative charts.
 - System sans for controls and prose; monospace for URLs, timestamps, and measurements.
-- Canvas movement runs on requestAnimationFrame only during live crawling, replay, or a finite transition. Critically damped springs preserve velocity through updates; new branches grow from their parents. A bounded Web Worker calculates layout off the main thread; replay reveals subsets of a cached full layout, keeping the camera stable. Subtle branch sway, travelling activity dots, and a tracking ring show live activity. Motion stops when paused and settled, offscreen, hidden, or reduced motion is requested. Edges are batched; device pixel ratio is capped at 2; labels appear on seeds and selection.
+- Canvas movement runs on requestAnimationFrame only during live crawling, replay, or a finite transition. Critically damped springs preserve velocity through updates; new branches grow from their parents. A bounded Web Worker calculates layout off the main thread; replay reveals subsets of a cached full layout, keeping the camera stable. A separate crawler agent travels between request destinations; URL points do not sway. Motion stops when paused and settled, offscreen, hidden, or reduced motion is requested. Edges are batched; device pixel ratio is capped at 2; labels appear on seeds and selection.
 - Stable graph inputs across unchanged polling responses; no overlapping snapshot requests; one active crawl step at a time.
 - Real graph seeds, frontier and parent-child links. Replay is explicitly labeled as a recorded crawl and advances through actual saved pages.
-- Library pagination at 60 rows; seed picker at 60 search matches; chat history initially limited to 24 messages; chat code loaded when its tab opens.
+- Library pagination at 60 rows; seed picker at 60 search matches; chat history initially limited to 10 messages; chat code loaded when its tab opens.
 - Canvas keyboard controls: arrows pan, +/- zoom, F or 0 fit. Modal focus is contained and returned on close. Source links are also accessible in tables and lists.
 
 ## Review checklist
@@ -47,8 +47,22 @@ Reviewed October 18–19, 2026. This is a focused reference set, not a claim to 
 
 ### Workflow checks
 
-1. Ask finds sources; “Review & start crawl” opens the starting-point configuration without claiming a crawl already started.
+1. Ask finds individual documents; “Crawl these documents” opens the starting-point configuration without claiming a crawl already started.
 2. A new crawl has zero silently selected sources. A URL-only crawl stays URL-only.
 3. A resource can be inspected in Ask or Sources without discarding the active question, filters or scroll context.
 4. Pausing keeps the queue, shows progress feedback, and stops ambient movement after settling. Completed crawls explain whether the page limit was reached.
 5. Saving is guarded against repeated requests and makes removal from Saved explicit.
+
+## October 21 refinement
+
+Reopened the reference video in the browser and inspected its moving radial crawler and bottom telemetry strip. The crawler is now an independent canvas agent: an illuminated core with 24 articulated legs, a short trail, and destination pings. Static URL nodes stay anchored. Destination changes come from processing URLs and fetch events; idle, paused and completed runs settle, and recorded replay is labeled.
+
+A bounded telemetry endpoint reports the current request, counters and the latest 80 events without repeatedly loading the graph. Request duration charts use actual recorded HTTP timings and display an empty state when timings are unavailable. Layout runs in a worker; frame drawing stays outside React state.
+
+Applied the current Anthropic frontend-design skill and Vercel web-interface guidelines again to the complete workflow: quiet neutral surfaces, a compact instrument strip, sentence-case labels, clear query and provider context, a two-panel search/document view, and editorial result rows instead of repeated purpose cards. Shared document styles are scoped to their view. Results combine discovered papers/reports with relevant captured pages, preserve query provenance, and expose filtering and duplicate counts.
+
+The live search uses the free OpenAlex, World Bank, and SEC EDGAR APIs. Company-report questions return individual SEC filings with the actual company, form, reporting period, and document path. Provider failures are explicit. Discovery metadata is distinguished from fetched page metadata; no full-document synthesis is implied. Saved records are durable, exact open-access URLs retain their evidence, and old session/login/navigation captures are excluded from normal Results while the archive is preserved.
+
+### Uiverse components
+
+Applied the user's [Uiverse library](https://uiverse.io/elements) to the real loading and interaction states: fast tactile button feedback, a restrained static dot pattern, and an accessible staggered-bar loading indicator. Exact component URLs, authors, modifications, and MIT notices are preserved in [uiverse-attribution.md](uiverse-attribution.md). The loading state responds to actual pending requests and never adds a simulated progress delay.

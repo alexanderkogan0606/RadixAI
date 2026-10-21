@@ -1,9 +1,11 @@
 /** Research Atlas indexes public metadata. It never stores fetched HTML or acts as a proxy. */
 import defaultCatalog from "./catalog.json" with { type:"json" };
 // @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
-import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl } from "./free-access.ts";
+import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl, sourceForUrl } from "./free-access.ts";
+// @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
+import { assessResource, linkPriority, queryTerms } from "./resource-quality.ts";
 export interface CatalogSource {
-  id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string; access?:string;
+  id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string; access?:string; exact?:boolean; title?:string; description?:string;
 }
 type Row = Record<string, unknown>;
 type DB = D1Database;
@@ -84,14 +86,17 @@ function tagText(doc: string, name: string): string {
 }
 export interface Extracted {
   title: string; description: string; canonicalUrl: string; links: string[];
+  linkDetails:{url:string;title:string;description?:string}[];
   feedEntries: {url:string;title:string;description:string}[]; tags: string[];
 }
 
 export function extractDocument(body: string, url: string, contentType = "text/html", query = ""): Extracted {
-  const links = new Set<string>();
+  const links = new Map<string,{url:string;title:string;description?:string}>();
   const entries: Extracted["feedEntries"] = [];
-  const addLink = (href: string) => {
-    try { const candidate = safeUrl(href,url); if (candidate !== url && !/\.(png|jpe?g|gif|svg|webp|css|js|woff2?|zip|exe|mp[34]|ico)(?:\?|$)/i.test(candidate)) links.add(candidate); } catch {}
+  const addLink = (href: string,title="",description="") => {
+    try { const candidate = safeUrl(href,url),detail={url:candidate,title:clean(title).slice(0,300),description:clean(description).slice(0,600)};
+      if(candidate!==url&&!/\.(png|jpe?g|gif|svg|webp|css|js|woff2?|zip|exe|mp[34]|ico)(?:\?|$)/i.test(candidate)&&linkPriority(detail,query)>=0){const previous=links.get(candidate);if(!previous||linkPriority(detail,query)>linkPriority(previous,query))links.set(candidate,detail)}
+    } catch {}
   };
   let title = "", description = "", canonicalUrl = url;
   const feed = /(?:rss|atom|xml)/i.test(contentType) || /^\s*(?:<\?xml[^>]*>\s*)?<(rss|feed)\b/i.test(body);
@@ -107,7 +112,7 @@ export function extractDocument(body: string, url: string, contentType = "text/h
       try {
         const itemUrl = safeUrl(href,url);
         entries.push({url:itemUrl,title:tagText(item,"title").slice(0,300),description:(tagText(item,"description") || tagText(item,"summary") || tagText(item,"content")).slice(0,600)});
-        addLink(itemUrl);
+        addLink(itemUrl,tagText(item,"title"),tagText(item,"description")||tagText(item,"summary")||tagText(item,"content"));
       } catch {}
     }
   } else {
@@ -115,19 +120,21 @@ export function extractDocument(body: string, url: string, contentType = "text/h
     const metas = [...body.matchAll(/<meta\b[^>]*>/gi)].map(m=>attrs(m[0]));
     const metadata = (key: string) => metas.find(a => (a.property || a.name || "").toLowerCase() === key)?.content || "";
     title = metadata("og:title") || title || tagText(body,"h1");
-    description = metadata("description") || metadata("og:description") || tagText(body,"p");
-    for (const match of body.matchAll(/<(?:a|link)\b[^>]*>/gi)) {
-      const a = attrs(match[0]);
+    const main=body.match(/<(?:article|main)\b[^>]*>([\s\S]*?)<\/(?:article|main)>/i)?.[1]||body;
+    const paragraphs=[...main.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)].slice(0,60).map(match=>clean(match[1]));
+    const descriptions=[metadata("description"),metadata("og:description"),...paragraphs].filter(Boolean);
+    description=descriptions.find(value=>value.length>=28&&!/^(?:we use cookies|this (?:site|website) uses cookies|accept (?:all )?cookies|all rights reserved|copyright)/i.test(value)&&!["access-gate","error"].includes(assessResource({url,title,description:value}).reason||""))||descriptions[0]||"";
+    for (const match of body.matchAll(/<a\b[^>]*>[\s\S]*?<\/a>|<link\b[^>]*>/gi)) {
+      const opening=match[0].match(/^<[^>]*>/)?.[0]||match[0],a = attrs(opening);
       if (a.rel?.toLowerCase() === "canonical" && a.href) {
         try { const candidate = safeUrl(a.href,url); if (new URL(candidate).hostname === new URL(url).hostname) canonicalUrl = candidate; } catch {}
       }
-      if (a.href && !/nofollow/i.test(a.rel || "")) addLink(a.href);
-      if (links.size >= 120) break;
+      if (a.href && !/nofollow/i.test(a.rel || "")) addLink(a.href,clean(match[0].replace(/^<[^>]*>/,""))||a.title||"");
+      if (links.size >= 600) break;
     }
   }
-  const text = `${title} ${description}`.toLowerCase();
-  const keywords = [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}-]+/u).filter(w=>w.length>2))].slice(0,20);
-  return {title:(title || new URL(url).hostname).slice(0,300),description:description.slice(0,600),canonicalUrl,links:[...links],feedEntries:entries,tags:keywords.filter(k=>text.includes(k))};
+  const words=new Set(queryTerms(`${title} ${description}`)),linkDetails=[...links.values()].sort((a,b)=>linkPriority(b,query)-linkPriority(a,query)).slice(0,120);
+  return {title:(title || new URL(url).hostname).slice(0,300),description:description.slice(0,600),canonicalUrl,links:linkDetails.map(link=>link.url),linkDetails,feedEntries:entries,tags:queryTerms(query).filter(word=>words.has(word))};
 }
 
 export function robotsRules(text: string, path: string, agent = BOT): {allowed:boolean;delayMs:number} {
@@ -226,6 +233,7 @@ export async function* exportDataChunks(db:DB,user:string,kind:string,catalog:Ca
     sources:{sql:"SELECT id,name,url,domain,created_at FROM atlas_sources WHERE user_id=? AND id>? ORDER BY id LIMIT 250",key:"id",map:customSource},
     jobs:{sql:"SELECT j.*, (SELECT COUNT(*) FROM atlas_queue q WHERE q.job_id=j.id AND q.status IN ('queued','processing')) AS queued FROM atlas_jobs j WHERE j.user_id=? AND j.id>? ORDER BY j.id LIMIT 250",key:"id",map:publicJob},
     pages:{sql:"SELECT * FROM atlas_pages WHERE user_id=? AND id>? ORDER BY id LIMIT 250",key:"id",map:publicPage},
+    documents:{sql:"SELECT * FROM atlas_documents WHERE user_id=? AND id>? ORDER BY id LIMIT 250",key:"id",map:r=>{const {user_id,...document}=r;void user_id;return document}},
     edges:{sql:"SELECT id,job_id AS jobId,source,target FROM atlas_edges WHERE user_id=? AND id>? ORDER BY id LIMIT 250",key:"id",map:r=>r},
     events:{sql:"SELECT id,job_id AS jobId,time,level,message,url FROM atlas_events WHERE user_id=? AND id>? ORDER BY id LIMIT 250",key:"id",map:r=>r},
     bookmarks:{sql:"SELECT resource_id FROM atlas_bookmarks WHERE user_id=? AND resource_id>? ORDER BY resource_id LIMIT 250",key:"resource_id",map:r=>r.resource_id},
@@ -254,7 +262,7 @@ export async function* exportDataChunks(db:DB,user:string,kind:string,catalog:Ca
   }
   if(kind === "pages"){yield* array("pages");return;}
   yield `{"exportedAt":${JSON.stringify(now())}`;
-  for(const name of ["sources","jobs","pages","edges","events","bookmarks","messages"]){
+  for(const name of ["sources","jobs","pages","documents","edges","events","bookmarks","messages"]){
     yield `,${JSON.stringify(name)}:`;
     yield* array(name);
   }
@@ -313,7 +321,7 @@ async function reserveHost(db:DB,host:string,knownState?:Row) {
 }
 
 async function responseText(response:Response):Promise<string> {
-  if (Number(response.headers.get("content-length") || 0) > MAX_BYTES) throw new CrawlSkipped("Page exceeds the 1 MB metadata-fetch limit.");
+  if (Number(response.headers.get("content-length") || 0) > MAX_BYTES) { await response.body?.cancel(); throw new CrawlSkipped("Page exceeds the 1 MB metadata-fetch limit."); }
   if (!response.body) return "";
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let bytes = 0, result = "";
@@ -328,7 +336,7 @@ async function responseText(response:Response):Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
-async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean}> {
+async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean;metadataSource?:CatalogSource}> {
   let current = safeUrl(url);
   for (let redirects=0;redirects<=3;redirects++) {
     if (!robots && !inScope(current,seedHosts,scope)) throw new CrawlSkipped("Redirect leaves the selected crawl scope.");
@@ -342,6 +350,11 @@ async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],sco
       current = safeUrl(location,current); continue;
     }
     const contentType = response.headers.get("content-type") || "";
+    const knownDocument=!robots&&/application\/pdf/i.test(contentType)?sourceForUrl(current,catalog) as CatalogSource|undefined:undefined;
+    if(response.ok&&knownDocument?.exact&&knownDocument.access==="Free"){
+      await response.body?.cancel();
+      return {url:current,body:"",status:response.status,contentType,noindex:/\b(noindex|none)\b/i.test(response.headers.get("x-robots-tag")||""),nofollow:true,metadataSource:knownDocument};
+    }
     if (!robots && response.ok && !/html|xml|rss|atom|text\/plain/i.test(contentType)) {
       await response.body?.cancel(); throw new CrawlSkipped("File type is not supported by this metadata crawler.");
     }
@@ -385,9 +398,14 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
     if (Number(job.processed) >= Number(job.max_pages)) {
       await finishJob(db,user,id,"Page limit reached."); return {job:publicJob(await getJob(db,user,id))};
     }
-    item = await first(db,"UPDATE atlas_queue SET status='processing' WHERE id=(SELECT id FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued' ORDER BY depth,created_at,id LIMIT 1) RETURNING *",id,user);
+    const candidates=await all(db,"SELECT * FROM atlas_queue WHERE job_id=? AND user_id=? AND status='queued' ORDER BY depth,created_at,id LIMIT 120",id,user);
+    candidates.sort((a,b)=>Number(a.depth)-Number(b.depth)||linkPriority({url:String(b.url)},String(job.query))-linkPriority({url:String(a.url)},String(job.query)));
+    item=candidates[0]||null;
     if (!item) { await finishJob(db,user,id,"All discovered URLs have been processed."); return {job:publicJob(await getJob(db,user,id))}; }
+    await db.batch([statement(db,"UPDATE atlas_queue SET status='processing' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",`Fetching ${String(item.url)}`,String(item.url))]);
+    const fetchStarted=Date.now();
     const fetched = await fetchText(db,String(item.url),false,JSON.parse(String(job.seed_hosts)),String(job.scope),catalog);
+    const fetchSummary=`HTTP ${fetched.status} · ${Date.now()-fetchStarted} ms`;
     const accessGate=detectPaywall(fetched.body,fetched.status,fetched.contentType);
     if(accessGate)throw new CrawlSkipped(accessGate);
     if ([401,403,429].includes(fetched.status)) throw new CrawlBlocked(`Source returned HTTP ${fetched.status}; access restrictions were respected.`);
@@ -396,34 +414,40 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
       .filter(a=>["robots",BOT.toLowerCase()].includes((a.name || "").toLowerCase()));
     const noindex = fetched.noindex || robotMetas.some(a=>/\b(noindex|none)\b/i.test(a.content || ""));
     if (noindex) throw new CrawlSkipped("Source requests no indexing; metadata was not saved.");
-    const extracted = extractDocument(fetched.body,fetched.url,fetched.contentType,String(job.query));
+    const extracted:Extracted=fetched.metadataSource?{title:fetched.metadataSource.title||fetched.metadataSource.name,description:fetched.metadataSource.description||"",canonicalUrl:fetched.url,links:[],linkDetails:[],feedEntries:[],tags:[]} : extractDocument(fetched.body,fetched.url,fetched.contentType,String(job.query));
     if(isKnownRestrictedUrl(extracted.canonicalUrl,catalog))throw new CrawlSkipped("Canonical URL belongs to a paid or mixed-access source; metadata was not saved.");
+    const quality=assessResource({url:extracted.canonicalUrl,title:extracted.title,description:extracted.description},String(job.query));
+    if(quality.reason==="access-gate"||quality.reason==="error")throw new CrawlSkipped(`${fetchSummary} · ${quality.reason==="access-gate"?"Session, login or verification gate":"Error page"}; not indexed.`);
     const source:CatalogSource = {id:String(item.source_id),name:"",url:String(item.url),domain:String(item.domain),category:String(item.category)};
-    const existing = await first(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? AND url=?",user,id,extracted.canonicalUrl);
+    const existing = quality.eligible?await first(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? AND url=?",user,id,extracted.canonicalUrl):null;
     const pageId = existing?.id || uid();
     const fetchedAt=now();
     const page=existing || {id:pageId,url:extracted.canonicalUrl,title:extracted.title,description:extracted.description,domain:item.domain,category:item.category,source_id:item.source_id,job_id:id,tags:JSON.stringify(extracted.tags),depth:item.depth,parent_url:item.parent_url,fetched_at:fetchedAt,status:"indexed"};
     const commands:D1PreparedStatement[] = [];
-    if (!existing) commands.push(statement(db,"INSERT INTO atlas_pages(id,user_id,job_id,source_id,url,title,description,domain,category,tags,depth,parent_url,fetched_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'indexed')",pageId,user,id,item.source_id,extracted.canonicalUrl,extracted.title,extracted.description,item.domain,item.category,JSON.stringify(extracted.tags),item.depth,item.parent_url,fetchedAt));
+    if (quality.eligible&&!existing) commands.push(statement(db,"INSERT INTO atlas_pages(id,user_id,job_id,source_id,url,title,description,domain,category,tags,depth,parent_url,fetched_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'indexed')",pageId,user,id,item.source_id,extracted.canonicalUrl,extracted.title,extracted.description,item.domain,item.category,JSON.stringify(extracted.tags),item.depth,item.parent_url,fetchedAt));
     const depth = Number(item.depth)+1;
     const nofollow = fetched.nofollow || robotMetas.some(a=>/\b(nofollow|none)\b/i.test(a.content || ""));
     if (!nofollow && depth <= Number(job.max_depth) && extracted.links.length) {
       const queueSize = await first(db,"SELECT count(*) AS total FROM atlas_queue WHERE job_id=?",id);
       let remaining = Math.max(0,MAX_QUEUE-Number(queueSize?.total || 0));
       for (const link of extracted.links) {
-      if (!remaining--) break;
+      if (!remaining) break;
       if (!inScope(link,JSON.parse(String(job.seed_hosts)),String(job.scope))) continue;
+      const detail=extracted.linkDetails.find(item=>item.url===link)||{url:link};
+      if(linkPriority(detail,String(job.query))<0||((quality.reason==="off-topic"||quality.reason==="insufficient-content")&&queryTerms(String(job.query)).length&&linkPriority(detail,String(job.query))<10))continue;
+      remaining--;
       commands.push(queueStatement(db,user,id,source,link,depth,extracted.canonicalUrl));
       commands.push(statement(db,"INSERT OR IGNORE INTO atlas_edges(id,user_id,job_id,source,target) VALUES(?,?,?,?,?)",uid(),user,id,extracted.canonicalUrl,link));
       }
     }
     commands.push(statement(db,"UPDATE atlas_queue SET status='done' WHERE id=?",item.id));
-    commands.push(statement(db,"UPDATE atlas_jobs SET processed=processed+1,indexed=indexed+?,updated_at=? WHERE id=?",existing?0:1,now(),id));
-    commands.push(eventStatement(db,user,id,"success",existing?"Duplicate canonical URL skipped.":`Indexed metadata: ${extracted.title}`,String(item.url)));
+    commands.push(statement(db,"UPDATE atlas_jobs SET processed=processed+1,indexed=indexed+?,updated_at=? WHERE id=?",quality.eligible&&!existing?1:0,now(),id));
+    const outcome=!quality.eligible?`Discovery only (${quality.reason}); not indexed: ${extracted.title}`:existing?"Duplicate canonical URL skipped.":fetched.metadataSource?`Indexed provider metadata: ${extracted.title}; PDF full text was not extracted.`:`Indexed metadata: ${extracted.title}`;
+    commands.push(eventStatement(db,user,id,quality.eligible?"success":"info",`${fetchSummary} · ${outcome}`,String(item.url)));
     // Keep individual D1 batches comfortably below statement limits.
     for (let i=0;i<commands.length;i+=70) await db.batch(commands.slice(i,i+70));
     const updatedJob=await completeIfDone(db,user,id);
-    return {job:publicJob(updatedJob),page:publicPage(page)};
+    return {job:publicJob(updatedJob),...(quality.eligible?{page:publicPage(page)}:{quality})};
   } catch(error) {
     if (item && error instanceof WaitForHost) {
       await statement(db,"UPDATE atlas_queue SET status='queued' WHERE id=?",item.id).run();

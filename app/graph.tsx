@@ -13,7 +13,7 @@ type Node={key:string;id:string;label:string;url:string;x:number;y:number;depth:
 type Line={source:string;target:string;tree:boolean};
 type Scene={nodes:Node[];lines:Line[];bounds:{left:number;right:number;top:number;bottom:number}};
 type Position={key:string;x:number;y:number};
-type Props={sources:Source[];pages:PageRecord[];edges:CrawlEdge[];select:(s:Source)=>void;selected:string;zoom:number;setZoom:(z:number)=>void;layoutKey:number;frontier?:CrawlFrontier[];seedUrls?:string[];active?:boolean;layoutPages?:PageRecord[];layoutEdges?:CrawlEdge[];layoutFrontier?:CrawlFrontier[]};
+type Props={sources:Source[];pages:PageRecord[];edges:CrawlEdge[];select:(s:Source)=>void;selected:string;zoom:number;setZoom:(z:number)=>void;layoutKey:number;frontier?:CrawlFrontier[];seedUrls?:string[];active?:boolean;crawlerUrl?:string;layoutPages?:PageRecord[];layoutEdges?:CrawlEdge[];layoutFrontier?:CrawlFrontier[]};
 const EMPTY_FRONTIER:CrawlFrontier[]=[];
 const EMPTY_SEEDS:string[]=[];
 const MONO='10px ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -99,7 +99,7 @@ function buildScene(sources:Source[],pages:PageRecord[],edges:CrawlEdge[],fronti
   return {nodes:list,lines:[...links.values()],bounds:{left,right,top,bottom}};
 }
 
-function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,frontier=EMPTY_FRONTIER,seedUrls=EMPTY_SEEDS,active=false,layoutPages,layoutEdges,layoutFrontier}:Props){
+function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,frontier=EMPTY_FRONTIER,seedUrls=EMPTY_SEEDS,active=false,crawlerUrl='',layoutPages,layoutEdges,layoutFrontier}:Props){
   const canvasRef=useRef<HTMLCanvasElement>(null);
   const scene=useMemo(()=>buildScene(sources,pages,edges,frontier,seedUrls),[sources,pages,edges,frontier,seedUrls]);
   // Replay reveals a subset of one complete layout, so every tick keeps the same geometry and camera.
@@ -107,6 +107,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
   const layoutScene=useMemo(()=>buildScene(sources,completePages,completeEdges,completeFrontier,seedUrls),[sources,completePages,completeEdges,completeFrontier,seedUrls]);
   const visibleSceneRef=useRef(scene),sceneRef=useRef(scene),layoutSceneRef=useRef(layoutScene);
   const zoomRef=useRef(zoom),selectedRef=useRef(selected),hoverRef=useRef(''),onZoomRef=useRef(setZoom),activeRef=useRef(active);
+  const crawlerRef=useRef(crawlerUrl);
   const offset=useRef({x:0,y:0}),size=useRef({width:900,height:500});
   const drag=useRef<{x:number;y:number;startX:number;startY:number;moved:boolean}|null>(null);
   const rendered=useRef<{node:Node;x:number;y:number}[]>([]),schedule=useRef<()=>void>(()=>{});
@@ -163,15 +164,18 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
   useEffect(()=>{zoomRef.current=zoom;schedule.current()},[zoom]);
   useEffect(()=>{selectedRef.current=selected;schedule.current()},[selected]);
   useEffect(()=>{activeRef.current=active;schedule.current()},[active]);
+  useEffect(()=>{crawlerRef.current=crawlerUrl;schedule.current()},[crawlerUrl]);
   useEffect(()=>{onZoomRef.current=setZoom},[setZoom]);
   useEffect(()=>{offset.current={x:0,y:0};schedule.current()},[layoutKey]);
   useEffect(()=>{
     const canvas=canvasRef.current;if(!canvas)return;const ctx=canvas.getContext('2d');if(!ctx)return;
     const preference=window.matchMedia('(prefers-reduced-motion: reduce)');
     let frame:number|null=null,disposed=false,renderCount=0,lastTime=0,flowTime=0;
-    let reducedMotion=preference.matches,onScreen=true,cameraReady=false,focusReady=false;
+    let reducedMotion=preference.matches,onScreen=true,cameraReady=false,focusReady=false,crawlerReady=false;
     const camera={x:{value:0,velocity:0},y:{value:0,velocity:0},scale:{value:1,velocity:0}},activity:Spring={value:0,velocity:0};
     const focusPosition={x:{value:0,velocity:0},y:{value:0,velocity:0}};
+    const crawlerPosition={x:{value:0,velocity:0},y:{value:0,velocity:0}};
+    const trail:{x:number;y:number}[]=[];
     const drawTimes:number[]=[];
     function draw(now:number){
       frame=null;if(disposed||document.hidden||!onScreen){lastTime=0;return}
@@ -187,14 +191,11 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
       const scale=camera.scale.value*zoomRef.current,points=new Map<string,{node:Node;x:number;y:number;alpha:number}>();
       for(const node of nodes){
         const point=motion.current.points.get(node.key);if(!point)continue;
-        // A tiny shared branch sway keeps a live crawl organic without running forces on the UI thread.
-        const amplitude=node.root?0:activity.value*(node.status==='indexed'?2.3:5.5);
-        const dx=amplitude*(Math.sin(flowTime*.72+point.branchPhase)+Math.sin(flowTime*1.1+point.phase)*.3);
-        const dy=amplitude*(Math.cos(flowTime*.63+point.branchPhase)+Math.sin(flowTime*.9+point.phase)*.3);
-        points.set(node.key,{node,x:w/2+offset.current.x+(point.x.value-camera.x.value)*scale+dx,y:h/2+offset.current.y+(point.y.value-camera.y.value)*scale+dy,alpha:point.alpha});
+        points.set(node.key,{node,x:w/2+offset.current.x+(point.x.value-camera.x.value)*scale,y:h/2+offset.current.y+(point.y.value-camera.y.value)*scale,alpha:point.alpha});
       }
       rendered.current=[...points.values()].filter(p=>p.alpha>.15&&p.x>-20&&p.x<w+20&&p.y>-20&&p.y<h+20);
-      const focus=nodes.find(n=>n.id===selectedRef.current||n.key===selectedRef.current||n.url===selectedRef.current)?.key||hoverRef.current;
+      const agentPoint=points.get(keyOf(crawlerRef.current));
+      const focus=nodes.find(n=>n.id===selectedRef.current||n.key===selectedRef.current||n.url===selectedRef.current)?.key||hoverRef.current||agentPoint?.node.key||'';
       const connected=new Set<string>(),rootCount=nodes.reduce((n,node)=>n+Number(node.root),0);
       for(const line of lines)if(line.source===focus||line.target===focus){connected.add(line.source);connected.add(line.target)}
       const dpr=Math.min(window.devicePixelRatio||1,2);ctx!.setTransform(dpr,0,0,dpr,0,0);ctx!.clearRect(0,0,w,h);
@@ -239,7 +240,7 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
           ctx!.lineWidth=.8;ctx!.strokeStyle=focused?'#9bddd0':'#8b8b8b';ctx!.beginPath();ctx!.arc(p.x,p.y,7+Math.sin(flowTime*2.4)*activity.value,0,Math.PI*2);ctx!.stroke();
           if(activity.value>.01){const pulse=(flowTime*.5)%1;ctx!.globalAlpha*=activity.value*(1-pulse)*.35;ctx!.beginPath();ctx!.arc(p.x,p.y,9+pulse*13,0,Math.PI*2);ctx!.stroke();ctx!.globalAlpha=points.get(node.key)!.alpha}
         }
-        if(focused||(node.root&&rootCount<=6)){
+        if((focused&&(selectedRef.current||hoverRef.current))||(node.root&&rootCount<=6&&(!agentPoint||Math.hypot(p.x-agentPoint.x,p.y-agentPoint.y)>70))){
           const raw=focused?node.label:shortUrl(node.url),text=raw.length>48?raw.slice(0,47)+'…':raw;
           ctx!.font=MONO;const textWidth=ctx!.measureText(text).width;
           const x=Math.max(8,Math.min(w-textWidth-16,p.x+12)),y=Math.max(45,Math.min(h-45,p.y-9));
@@ -255,6 +256,37 @@ function Graph({sources,pages,edges,select,selected,zoom,setZoom,layoutKey,front
         ctx!.lineWidth=.85;ctx!.strokeStyle='#9bddd0';ctx!.beginPath();ctx!.arc(x,y,7+Math.sin(flowTime*2.4)*activity.value,0,Math.PI*2);ctx!.stroke();
         if(activity.value>.01){const pulse=(flowTime*.5)%1;ctx!.globalAlpha=activity.value*(1-pulse)*.4;ctx!.beginPath();ctx!.arc(x,y,9+pulse*13,0,Math.PI*2);ctx!.stroke();ctx!.globalAlpha=1}
       }else focusReady=false;
+      // The crawler is an independent agent. Only request events change its destination.
+      if(agentPoint){
+        moving=stepSpring(crawlerPosition.x,agentPoint.x,seconds,reducedMotion||!crawlerReady)||moving;
+        moving=stepSpring(crawlerPosition.y,agentPoint.y,seconds,reducedMotion||!crawlerReady)||moving;
+        crawlerReady=true;
+        const x=crawlerPosition.x.value,y=crawlerPosition.y.value;
+        canvas!.dataset.crawlerUrl=crawlerRef.current;
+        canvas!.dataset.crawlerPosition=`${x.toFixed(1)},${y.toFixed(1)}`;
+        if(!reducedMotion){trail.push({x,y});if(trail.length>34)trail.shift();}
+        if(trail.length>1){
+          ctx!.lineWidth=1;
+          for(let i=1;i<trail.length;i++){ctx!.strokeStyle=`rgba(137,230,202,${i/trail.length*.26})`;ctx!.beginPath();ctx!.moveTo(trail[i-1].x,trail[i-1].y);ctx!.lineTo(trail[i].x,trail[i].y);ctx!.stroke();}
+        }
+        const halo=ctx!.createRadialGradient(x,y,3,x,y,52);
+        halo.addColorStop(0,'rgba(121,230,191,.23)');halo.addColorStop(1,'rgba(121,230,191,0)');ctx!.fillStyle=halo;ctx!.fillRect(x-52,y-52,104,104);
+        // Radial articulated legs echo the reference while the web itself stays still.
+        ctx!.lineWidth=.9;
+        for(let i=0;i<24;i++){
+          const angle=i/24*Math.PI*2,bend=Math.sin(flowTime*3+i*.8)*activity.value*.15;
+          const reach=27+(i%3)*5+Math.sin(flowTime*2.5+i)*activity.value*3;
+          ctx!.strokeStyle=i%3===0?'rgba(180,255,224,.85)':'rgba(118,221,180,.52)';
+          ctx!.beginPath();ctx!.moveTo(x+Math.cos(angle)*9,y+Math.sin(angle)*9);
+          ctx!.lineTo(x+Math.cos(angle+bend)*20,y+Math.sin(angle+bend)*20);
+          ctx!.lineTo(x+Math.cos(angle+bend+.12)*reach,y+Math.sin(angle+bend+.12)*reach);ctx!.stroke();
+        }
+        ctx!.fillStyle='#182d27';ctx!.strokeStyle='#a8efd1';ctx!.lineWidth=1;ctx!.beginPath();ctx!.arc(x,y,10,0,Math.PI*2);ctx!.fill();ctx!.stroke();
+        ctx!.fillStyle='#c4ffe3';ctx!.beginPath();ctx!.arc(x,y,3.5,0,Math.PI*2);ctx!.fill();
+        if(activity.value>.01){const pulse=(flowTime*.7)%1;ctx!.strokeStyle=`rgba(154,235,200,${(1-pulse)*.32})`;ctx!.beginPath();ctx!.arc(x,y,16+pulse*35,0,Math.PI*2);ctx!.stroke();}
+        ctx!.font=MONO;ctx!.fillStyle='#c2e6d8';const label=activeRef.current?'crawler / active':'crawler / resting';
+        ctx!.fillText(label,Math.max(12,Math.min(w-125,x+42)),Math.max(65,Math.min(h-60,y-15)));
+      }else{crawlerReady=false;trail.length=0;delete canvas!.dataset.crawlerUrl;delete canvas!.dataset.crawlerPosition;}
       const duration=performance.now()-started;drawTimes.push(duration);if(drawTimes.length>120)drawTimes.shift();
       canvas!.dataset.renderCount=String(++renderCount);canvas!.dataset.drawMs=String(Math.round(duration*100)/100);
       canvas!.dataset.averageDrawMs=String(Math.round(drawTimes.reduce((sum,time)=>sum+time,0)/drawTimes.length*100)/100);
@@ -307,7 +339,7 @@ function samePage(a:PageRecord,b:PageRecord){
   return a.id===b.id&&a.url===b.url&&a.parentUrl===b.parentUrl&&a.sourceId===b.sourceId&&a.status===b.status&&a.depth===b.depth&&a.title===b.title&&a.name===b.name&&a.description===b.description&&a.domain===b.domain&&a.category===b.category&&sameList(a.tags,b.tags,(x,y)=>x===y);
 }
 // Polling returns fresh objects; unchanged evidence must not recompute the layout or repaint.
-export default memo(Graph,(a,b)=>a.active===b.active&&a.selected===b.selected&&a.zoom===b.zoom&&a.layoutKey===b.layoutKey&&a.select===b.select&&a.setZoom===b.setZoom&&
+export default memo(Graph,(a,b)=>a.active===b.active&&a.crawlerUrl===b.crawlerUrl&&a.selected===b.selected&&a.zoom===b.zoom&&a.layoutKey===b.layoutKey&&a.select===b.select&&a.setZoom===b.setZoom&&
   sameList(a.sources,b.sources,(x,y)=>x.id===y.id&&x.name===y.name&&x.url===y.url&&x.feedUrl===y.feedUrl&&x.domain===y.domain&&x.category===y.category&&x.access===y.access&&x.geography===y.geography&&x.crawlMethod===y.crawlMethod)&&
   sameList(a.layoutPages,b.layoutPages,samePage)&&sameList(a.layoutFrontier,b.layoutFrontier,samePage)&&sameList(a.layoutEdges,b.layoutEdges,(x,y)=>x.source===y.source&&x.target===y.target)&&
   sameList(a.pages,b.pages,samePage)&&sameList(a.frontier,b.frontier,samePage)&&

@@ -1,6 +1,6 @@
 /** Access is a destination property: a free seed never makes all its outbound links free. */
 export type ResourceAccess = "Free" | "Freemium" | "Mixed" | "Paid" | "Unknown";
-export interface AccessSource { id?:string; url:string; feedUrl?:string; access?:string }
+export interface AccessSource { id?:string; url:string; feedUrl?:string; access?:string; exact?:boolean }
 
 export function isFreeSource(source:{access?:string}):boolean { return source.access === "Free"; }
 function accessOf(source?:AccessSource):ResourceAccess {
@@ -17,7 +17,7 @@ function sourceIndex(sources:readonly AccessSource[]) {
     try{
       const url=new URL(address);if(url.protocol!=="https:"||url.username||url.password)continue;
       const host=hostOf(url),entries=index.get(host)||[];
-      entries.push({source,url,path:url.pathname.replace(/\/+$/,"")||"/",exact});index.set(host,entries);
+      entries.push({source,url,path:url.pathname.replace(/\/+$/,"")||"/",exact:exact||source.exact===true});index.set(host,entries);
     }catch{/* An invalid catalog URL cannot establish access. */}
   }
   indexes.set(sources,index);return index;
@@ -34,7 +34,9 @@ export function sourceForUrl(address:string,sources:readonly AccessSource[]):Acc
   for(const candidate of sourceIndex(sources).get(hostOf(url))||[]){
     const matches=candidate.exact ? path===candidate.path : candidate.path==="/"||path===candidate.path||path.startsWith(candidate.path+"/");
     if(!matches||[...candidate.url.searchParams].some(([key,value])=>!url.searchParams.getAll(key).includes(value)))continue;
-    const score=candidate.path.length*100+candidate.url.searchParams.size;
+    if(candidate.source.exact){const actual=new URLSearchParams(url.search),expected=new URLSearchParams(candidate.url.search);actual.sort();expected.sort();if(actual.toString()!==expected.toString())continue;}
+    // A provider-confirmed open document overrides a broad publisher classification only at its exact URL.
+    const score=(candidate.source.exact?1_000_000:0)+candidate.path.length*100+candidate.url.searchParams.size;
     const restricted=["Paid","Mixed","Freemium"].includes(accessOf(candidate.source));
     if(score>bestScore||(score===bestScore&&restricted)){best=candidate.source;bestScore=score;}
   }
