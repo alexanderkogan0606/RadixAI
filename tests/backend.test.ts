@@ -4,6 +4,8 @@ import { DatabaseSync } from "node:sqlite";
 // Node's native TypeScript stripping runs these tests without the worker runtime.
 // @ts-expect-error Node requires the TypeScript extension for direct execution.
 import { safeUrl, inScope, extractDocument, robotsRules, researchDomain, createJob, stepJob, controlJob, readState, readRun, addSource, setBookmark, exportDataChunks } from "../lib/crawler.ts";
+// @ts-expect-error Node requires the TypeScript extension for direct execution.
+import {parseAgentReview} from "../lib/crawl-supervision.ts";
 
 test("URL validation rejects private and alternate encoded IP targets",()=>{
   for (const url of ["http://sec.gov/","https://127.0.0.1/","https://2130706433/","https://0x7f000001/","https://[::1]/","https://[::ffff:127.0.0.1]/","https://10.0.0.1/","https://169.254.169.254/","https://localhost/","https://service.internal/","https://localhost./","https://127.0.0.1.nip.io/","https://user:pass@sec.gov/","https://sec.gov:444/"]) {
@@ -365,11 +367,99 @@ test("Backend database call budget for a cached-host leaf crawl and state snapsh
     const start=performance.now();
     await stepJob(db,'alice',String(created.job.id));
     t.diagnostic(`Cached-host leaf step: ${metrics.calls} D1 requests, ${metrics.statements} SQL statements, ${(performance.now()-start).toFixed(1)} ms with simulated 10 ms D1 latency`);
-    assert.ok(metrics.calls<=11,'A leaf crawl should not re-read host, job, or page state unnecessarily.');
+    assert.ok(metrics.calls<=15,'The 11-call leaf budget permits four explicit live stage writes; host, job and page reads must not be repeated.');
     metrics.calls=0;metrics.statements=0;
     await readState(db,'alice');
     t.diagnostic(`State snapshot: ${metrics.calls} D1 requests, ${metrics.statements} SQL statements`);
     assert.equal(metrics.calls,1,'All snapshot panels should share one D1 batch.');
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Real crawl stages persist in order and fetch events precede only the actual document requests",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;
+  cacheRobots("publicresearch.org");cacheRobots("papers.org");
+  const source="https://publicresearch.org/article",destination="https://papers.org/bank-mergers",requests:string[]=[];
+  const stages=()=>sqlite.prepare("SELECT message,url FROM atlas_events WHERE user_id='alice' AND message LIKE 'Stage · %' ORDER BY time,id").all();
+  globalThis.fetch=(async(input:RequestInfo|URL)=>{
+    const url=String(input);requests.push(url);const latest=stages().at(-1);
+    assert.match(String(latest?.message),/^Stage · fetch · Requesting document /);assert.equal(latest?.url,url);
+    if(url===source)return new Response(null,{status:302,headers:{location:destination}});
+    return new Response("<title>Bank merger operating outcomes</title><p>This study compares bank merger outcomes and operating costs across several financial institutions.</p>",{headers:{"content-type":"text/html"}});
+  }) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",urls:[source],scope:"linked-domains",maxDepth:0},[]),id=String(created.job.id);
+    assert.deepEqual(stages().map(event=>String(event.message).split(" · ")[1]),["objective","sources"]);
+    const result=await stepJob(db,"alice",id,[]);assert.equal(result.job.indexed,1);
+    assert.deepEqual(requests,[source,destination]);
+    const events=stages();assert.deepEqual(events.map(event=>String(event.message).split(" · ")[1]),["objective","sources","access","fetch","access","fetch","extract","review","save","complete"]);
+    assert.deepEqual(events.filter(event=>/^Stage · (?:access|fetch) · /.test(String(event.message))).map(event=>event.url),[source,source,destination,destination]);
+    assert.ok(events.filter(event=>/^Stage · (?:extract|review|save) · /.test(String(event.message))).every(event=>event.url===destination));
+    const state=await readState(db,"alice");assert.match(String(state.events[0].message),/^Stage · complete · /);
+    assert.ok(state.events.some(event=>String(event.message)===`Fetching ${source}`));assert.ok(state.events.some(event=>/^HTTP 200 · \d+ ms · Indexed metadata:/.test(String(event.message))));
+    assert.deepEqual((await readState(db,"bob")).events,[]);
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Robots and paywall skips never claim extraction, review or saved metadata",async()=>{
+  const originalFetch=globalThis.fetch;
+  try{
+    for(const blockedBy of ["robots","paywall"]){
+      const {db,sqlite,cacheRobots}=testDatabase();if(blockedBy==="paywall")cacheRobots("publicresearch.org");
+      const requests:string[]=[];
+      globalThis.fetch=(async(input:RequestInfo|URL)=>{const url=String(input);requests.push(url);
+        if(blockedBy==="robots"){assert.equal(url,"https://publicresearch.org/robots.txt");return new Response("User-agent: *\nDisallow: /article",{headers:{"content-type":"text/plain"}});}
+        return new Response("<title>Subscribe to continue reading</title>",{headers:{"content-type":"text/html"}});
+      }) as typeof fetch;
+      try{
+        const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/article"],maxDepth:0},[]);
+        const result=await stepJob(db,"alice",String(created.job.id),[]);assert.equal(result.job.indexed,0);assert.equal(result.job.errors,1);
+        const events=sqlite.prepare("SELECT message,url FROM atlas_events WHERE message LIKE 'Stage · %' ORDER BY time,id").all();
+        assert.deepEqual(events.map(event=>String(event.message).split(" · ")[1]),blockedBy==="robots"?["objective","sources","access","complete"]:["objective","sources","access","fetch","complete"]);
+        assert.equal(requests.length,1);assert.ok(!events.some(event=>String(event.url).endsWith("robots.txt")),"Robots network calls must not impersonate a document fetch stage.");
+        const review=(await readState(db,"alice")).events.map(event=>parseAgentReview(String(event.message))).find(Boolean);
+        assert.ok(review);assert.equal(review.decision,"reject");assert.equal(review.storeMetadata,false);assert.equal(review.agents.length,4);
+      }finally{sqlite.close();}
+    }
+  }finally{globalThis.fetch=originalFetch;}
+});
+
+test("Waiting for host permission remains in access stage without inventing an HTTP request",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publicresearch.org");
+  sqlite.prepare("UPDATE atlas_hosts SET next_allowed_at=?").run(Date.now()+10000);
+  globalThis.fetch=(async()=>{throw new Error("A waiting source must not be fetched");}) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{urls:["https://publicresearch.org/article"],maxDepth:0},[]);
+    const result=await stepJob(db,"alice",String(created.job.id),[]);assert.equal(result.waiting,true);assert.equal(result.job.processed,0);
+    const state=await readState(db,"alice"),stages=state.events.filter(event=>String(event.message).startsWith("Stage · "));
+    assert.match(String(stages[0].message),/^Stage · access · /);assert.ok(!stages.some(event=>/Stage · (fetch|extract|review|save|complete) · /.test(String(event.message))));
+    assert.ok(state.events.some(event=>/Waiting for the source's crawl delay/.test(String(event.message))));
+    assert.ok(!state.events.some(event=>parseAgentReview(String(event.message))),"A scheduling wait is not a supervisor rejection.");
+    assert.equal(state.frontier[0].status,"queued");
+  }finally{globalThis.fetch=originalFetch;sqlite.close();}
+});
+
+test("Chief of Staff blocks incidental-subject indexing, preserves useful links and persists complete owner-scoped agent reports",async()=>{
+  const {db,sqlite,cacheRobots}=testDatabase(),originalFetch=globalThis.fetch;cacheRobots("publicresearch.org");
+  const catalog=[{id:"free",name:"Public reports",url:"https://publicresearch.org/",domain:"Finance",access:"Free"}];
+  globalThis.fetch=(async(input:RequestInfo|URL)=>new Response(String(input).endsWith("/childcare")?
+    `<title>Employee childcare benefits</title><p>The law firm specializes in bank mergers and corporate transactions. This report evaluates childcare benefits and employee work schedules.</p><a href="/bank-mergers">Bank merger operating outcomes</a>`:
+    `<title>Bank merger operating outcomes</title><p>This study compares bank merger outcomes and operating costs across several financial institutions.</p>`,{headers:{"content-type":"text/html"}})) as typeof fetch;
+  try{
+    const created=await createJob(db,"alice",{query:"bank mergers",urls:["https://publicresearch.org/childcare"],maxDepth:1},catalog),id=String(created.job.id);
+    const first=await stepJob(db,"alice",id,catalog);assert.equal(first.job.indexed,0);
+    let state=await readState(db,"alice");assert.equal(state.pages.length,0);assert.equal(state.edges.length,1);
+    const auditEvent=state.events.find(event=>String(event.message).startsWith("Agent review · "));assert.ok(auditEvent);
+    assert.ok(String(auditEvent.message).length>900,"Structured reports must not be truncated by the ordinary event-message limit.");
+    const initial=parseAgentReview(String(auditEvent.message));assert.ok(initial);
+    assert.equal(initial.decision,"discover");assert.equal(initial.storeMetadata,false);assert.equal(initial.allowDiscovery,true);
+    assert.equal(initial.agents.length,4);assert.equal(initial.agents.find(agent=>agent.id==="relevance-reviewer")?.verdict,"fail");
+    assert.equal(initial.query,"bank mergers");assert.equal(initial.url,"https://publicresearch.org/childcare");
+    sqlite.exec("UPDATE atlas_hosts SET next_allowed_at=0");
+    const second=await stepJob(db,"alice",id,catalog);assert.equal(second.job.indexed,1);
+    state=await readState(db,"alice");const audits=state.events.map(event=>parseAgentReview(String(event.message))).filter(Boolean);
+    assert.equal(audits.length,2);assert.ok(audits.some(audit=>audit?.decision==="approve"&&audit.storeMetadata));
+    assert.deepEqual(state.pages.map(page=>page.url),["https://publicresearch.org/bank-mergers"]);
+    assert.deepEqual((await readState(db,"bob")).events,[]);await assert.rejects(()=>readRun(db,"bob",id),/not found/);
   }finally{globalThis.fetch=originalFetch;sqlite.close();}
 });
 

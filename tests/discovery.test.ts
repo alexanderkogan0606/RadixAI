@@ -161,3 +161,131 @@ test("Blank and operational queries make no network requests",async()=>{
     assert.deepEqual(result.documents,[]);assert.ok(result.providers.every(p=>p.status==="empty"));
   }
 });
+
+function crossrefWork(overrides:Record<string,unknown>={}){
+  return {DOI:"10.1234/bank.1",title:["Artificial intelligence in banking: measured outcomes"],abstract:"<jats:p>This study measures artificial intelligence adoption in banking using financial performance and customer service outcomes.</jats:p>",
+    published:{"date-parts":[[2025,4,9]]},URL:"https://doi.org/10.1234/bank.1",type:"journal-article",
+    license:[{URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"vor",start:{"date-parts":[[2020,1,1]],timestamp:Date.UTC(2020,0,1),"date-time":"2020-01-01T00:00:00Z"}}],
+    link:[{URL:"https://repository.edu/papers/banking-ai.pdf","content-type":"application/pdf","content-version":"vor"}],...overrides};
+}
+function crossrefFixture(items:unknown[],requests:string[]=[],documentResponse:()=>Response=()=>new Response("%PDF-1.7\n% Public document fixture",{headers:{"content-type":"application/pdf"}})):typeof fetch {
+  return async input=>{const url=new URL(String(input));requests.push(url.href);
+    if(url.hostname==="api.openalex.org")return new Response(null,{status:429});
+    if(url.hostname==="search.worldbank.org")return json({documents:{}});
+    if(url.hostname==="api.crossref.org")return json({status:"ok",message:{items}});
+    return documentResponse();
+  };
+}
+
+test("OpenAlex failures fall back to licensed and publicly reachable Crossref articles while retaining provider failures",async()=>{
+  const requests:string[]=[];
+  const result=await discoverDocuments("AI in banking",{fetcher:crossrefFixture([crossrefWork()],requests)});
+  assert.deepEqual(result.providers.map(provider=>[provider.provider,provider.status]),[["OpenAlex","rate-limited"],["World Bank","empty"],["Crossref","ok"]]);
+  assert.equal(result.documents.length,1);const document=result.documents[0];
+  assert.equal(document.provider,"Crossref");assert.equal(document.access,"Free");assert.equal(document.publishedAt,"2025-04-09");
+  assert.equal(document.url,"https://repository.edu/papers/banking-ai.pdf");assert.equal(document.fullTextUrl,document.url);
+  assert.match(document.providerRecordUrl,/api\.crossref\.org\/works\/10.1234%2Fbank.1$/);
+  assert.match(document.accessBasis,/Creative Commons license/);assert.match(document.accessBasis,/public PDF response was fetched successfully without credentials/);assert.doesNotMatch(document.accessBasis,/has not been independently checked/);
+  assert.match(document.description,/This study measures/);assert.doesNotMatch(document.description,/<[^>]+>/);
+  const api=new URL(requests.find(url=>url.includes("api.crossref.org"))!);
+  assert.equal(api.searchParams.get("query"),"artificial intelligence in banking");assert.equal(api.searchParams.get("filter"),"has-abstract:true,has-license:true");
+  assert.equal(requests.filter(url=>url.includes("repository.edu")).length,1);
+});
+
+test("Successful and empty OpenAlex searches never trigger the Crossref fallback",async()=>{
+  for(const works of [[],[work()]]){
+    const requests:{url:URL;init?:RequestInit}[]=[];
+    const result=await discoverDocuments(topic,{fetcher:fixtureFetch({results:works},{documents:{}},requests)});
+    assert.equal(result.providers.length,2);assert.equal(requests.length,2);assert.ok(!requests.some(request=>request.url.hostname==="api.crossref.org"));
+  }
+});
+
+test("Crossref licenses exclude TDM contracts, embargoes, spoofed hosts, conflicting dates and nonexistent CC versions",async()=>{
+  const badLicenses=[
+    {URL:"https://publisher.edu/tdm","content-version":"tdm"},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"tdm"},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"stm-asf"},
+    {URL:"https://creativecommons.org.evil.test/licenses/by/4.0/","content-version":"vor"},
+    {URL:"https://user:secret@creativecommons.org/licenses/by/4.0/","content-version":"vor"},
+    {URL:"https://creativecommons.org/licenses/by/4.5/","content-version":"vor"},
+    {URL:"https://creativecommons.org/publicdomain/mark/1.0/","content-version":"vor"},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"vor",start:{timestamp:Date.UTC(2099,0,1)}},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"vor",start:{timestamp:Date.UTC(2020,0,1),"date-parts":[[2099,1,1]]}},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"vor",start:{timestamp:Date.UTC(2020,0,1),"date-time":"nonsense"}},
+    {URL:"https://creativecommons.org/licenses/by/4.0/","content-version":"vor",start:{timestamp:Date.UTC(2020,0,1)/1000}},
+  ];
+  const requests:string[]=[];
+  const result=await discoverDocuments(topic,{fetcher:crossrefFixture(badLicenses.map((license,index)=>crossrefWork({DOI:`10.1234/bad.${index}`,license:[license]})),requests)});
+  assert.deepEqual(result.documents,[]);assert.equal(result.providers.find(provider=>provider.provider==="Crossref")?.status,"empty");
+  assert.ok(requests.every(url=>/api\.openalex|search\.worldbank|api\.crossref/.test(url)),"Unlicensed or embargoed content must not be probed or claimed free.");
+});
+
+test("Crossref accepted-manuscript licenses apply only to their matching copy and never retry an unlicensed DOI",async()=>{
+  const license=[{URL:"http://creativecommons.org/licenses/by-nc/4.0/","content-version":"am"}];
+  const vor=await discoverDocuments(topic,{fetcher:crossrefFixture([crossrefWork({license})])});assert.equal(vor.documents.length,0);
+  const manuscript=crossrefWork({license,link:[{URL:"https://repository.edu/papers/accepted.pdf","content-type":"application/pdf","content-version":"am"}]});
+  const accepted=await discoverDocuments(topic,{fetcher:crossrefFixture([manuscript])});assert.equal(accepted.documents.length,1);assert.match(accepted.documents[0].accessBasis,/linked accepted manuscript/);
+  const requests:string[]=[];
+  const blocked=await discoverDocuments(topic,{fetcher:crossrefFixture([manuscript],requests,()=>new Response(null,{status:403}))});
+  assert.equal(blocked.documents.length,0);assert.ok(!requests.some(url=>url.includes("doi.org")));assert.match(blocked.providers.find(provider=>provider.provider==="Crossref")?.message||"",/no document passed the public-access check/);
+});
+
+test("Crossref rejects unavailable public copies, missing abstracts and incidental or off-topic subjects",async()=>{
+  const noAbstract=crossrefWork({abstract:undefined}),incidental=crossrefWork({title:["Country access-to-information disclosure rules"],abstract:"This document describes access to information (AI) at the World Bank and explains the rules governing administrative disclosure."});
+  const quality=await discoverDocuments("AI in banking",{fetcher:crossrefFixture([noAbstract,incidental])});assert.equal(quality.documents.length,0);
+  for(const response of [()=>new Response(null,{status:403}),()=>new Response("<html><body><main><h1>Sign in to read</h1><p>Your session has expired.</p></main></body></html>",{headers:{"content-type":"text/html"}}),()=>new Response("Not a PDF",{headers:{"content-type":"application/pdf"}})]){
+    const blocked=await discoverDocuments(topic,{fetcher:crossrefFixture([crossrefWork()],[],response)});assert.equal(blocked.documents.length,0);assert.match(blocked.providers.find(provider=>provider.provider==="Crossref")?.message||"",/public-access check/);
+  }
+});
+
+test("Crossref decodes encoded abstracts and deduplicates normalized DOIs after public verification",async()=>{
+  const result=await discoverDocuments(topic,{fetcher:crossrefFixture([
+    crossrefWork({abstract:"&lt;jats:p&gt;This study measures artificial intelligence adoption in banking and customer outcomes.&lt;/jats:p&gt;"}),
+    crossrefWork({DOI:"10.1234/BANK.1",link:[{URL:"https://repository.edu/papers/second-copy.pdf","content-type":"application/pdf","content-version":"vor"}]}),
+  ])});
+  assert.equal(result.documents.length,1);assert.doesNotMatch(result.documents[0].description,/<|&lt;|jats:/);
+});
+
+test("SaaS pricing and retention requests require the SaaS subject and a requested business measure",async()=>{
+  const items=[
+    crossrefWork({DOI:"10.1234/ott",title:["Customer retention in OTT platforms in Ahmedabad"],abstract:"This study evaluates pricing strategies and customer retention in streaming television platforms serving households in Ahmedabad."}),
+    crossrefWork({DOI:"10.1234/ai-service",title:["Artificial intelligence customer service in Indonesian SaaS firms"],abstract:"This study evaluates software-as-a-service customer service automation, agent satisfaction and response time in Indonesian firms."}),
+    crossrefWork({DOI:"10.1234/saas-pricing",title:["SaaS pricing and customer retention in enterprise software"],abstract:"This study evaluates software-as-a-service pricing strategies and customer retention using subscription cohorts and revenue outcomes."}),
+  ];
+  const result=await discoverDocuments("SaaS pricing and customer retention",{fetcher:crossrefFixture(items)});
+  assert.deepEqual(result.documents.map(document=>document.doi),["10.1234/saas-pricing"]);
+});
+
+test("Crossref caches and coalesces metadata while checking public access again for each search",async()=>{
+  const requests:string[]=[],fetcher=crossrefFixture([crossrefWork()],requests);
+  const results=await Promise.all([discoverDocuments(topic,{fetcher}),discoverDocuments(topic,{fetcher})]);
+  assert.ok(results.every(result=>result.documents.length===1));
+  await discoverDocuments(topic,{fetcher});
+  assert.equal(requests.filter(url=>url.includes("api.crossref.org")).length,1);
+  assert.equal(requests.filter(url=>url.includes("repository.edu")).length,3,"A metadata cache must not skip the current public-access check.");
+});
+
+test("Crossref serializes its public API at one concurrent request and one start per second",async()=>{
+  let active=0,maxActive=0,apiCalls=0;const starts:number[]=[];
+  const fetcher:typeof fetch=async input=>{
+    const url=new URL(String(input));if(url.hostname==="api.crossref.org"){
+      apiCalls++;active++;maxActive=Math.max(maxActive,active);starts.push(Date.now());await new Promise(resolve=>setTimeout(resolve,apiCalls===1?1200:20));active--;
+      return json({status:"ok",message:{items:[crossrefWork()]}});
+    }
+    return crossrefFixture([])(input);
+  };
+  const results=await Promise.all([discoverDocuments(topic,{fetcher}),discoverDocuments(`${topic} outcomes`,{fetcher})]);
+  assert.ok(results.every(result=>result.documents.length===1));assert.equal(apiCalls,2);assert.equal(maxActive,1);assert.ok(starts[1]-starts[0]>=1000);
+});
+
+test("The fallback and public-access checks share the original bounded search deadline",async()=>{
+  const started=performance.now();
+  const fetcher:typeof fetch=async input=>{
+    const url=new URL(String(input));if(url.hostname==="api.openalex.org")return new Promise(()=>{});
+    if(url.hostname==="search.worldbank.org")return json({documents:{}});
+    if(url.hostname==="api.crossref.org")return json({status:"ok",message:{items:[crossrefWork()]}});
+    return new Promise(()=>{});
+  };
+  const result=await discoverDocuments(topic,{fetcher,timeoutMs:80});assert.equal(result.documents.length,0);assert.ok(performance.now()-started<250);
+  assert.equal(result.providers[0].status,"timeout");assert.ok(result.providers.some(provider=>provider.provider==="Crossref"));
+});

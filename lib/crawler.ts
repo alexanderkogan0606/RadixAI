@@ -4,8 +4,11 @@ import defaultCatalog from "./catalog.json" with { type:"json" };
 import { classifyPageAccess, detectPaywall, isFreeSource, isKnownRestrictedUrl, sourceForUrl } from "./free-access.ts";
 // @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
 import { assessResource, linkPriority, queryTerms } from "./resource-quality.ts";
+// @ts-expect-error Node's native TypeScript test runner requires the explicit extension.
+import { AGENT_REVIEW_PREFIX, reviewCrawlCandidate, reviewCrawlFailure, type SupervisionReview } from "./crawl-supervision.ts";
 export interface CatalogSource {
   id: string; name: string; url: string; domain: string; category?: string; feedUrl?: string; access?:string; exact?:boolean; title?:string; description?:string;
+  provider?:string;query?:string;queryHistory?:string[];
 }
 type Row = Record<string, unknown>;
 type DB = D1Database;
@@ -14,6 +17,7 @@ const MAX_BYTES = 1_000_000;
 const MAX_QUEUE = 1500;
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID();
+let eventSequence=0;
 
 export class ApiError extends Error {
   status: number;
@@ -172,8 +176,16 @@ export function robotsRules(text: string, path: string, agent = BOT): {allowed:b
 function statement(db: DB, sql: string, ...params: unknown[]) { return db.prepare(sql).bind(...params); }
 async function all(db: DB, sql: string, ...params: unknown[]): Promise<Row[]> { return (await statement(db,sql,...params).all<Row>()).results; }
 async function first(db: DB, sql: string, ...params: unknown[]): Promise<Row|null> { return statement(db,sql,...params).first<Row>(); }
-function eventStatement(db:DB,user:string,job:string,level:string,message:string,url:string|null=null) {
-  return statement(db,"INSERT INTO atlas_events(id,user_id,job_id,time,level,message,url) VALUES(?,?,?,?,?,?,?)",uid(),user,job,now(),level,message.slice(0,900),url);
+function eventStatement(db:DB,user:string,job:string,level:string,message:string,url:string|null=null,messageLimit=900) {
+  const timestamp=Date.now(),id=`${String(timestamp).padStart(13,"0")}-${String(eventSequence++).padStart(10,"0")}-${uid()}`;
+  return statement(db,"INSERT INTO atlas_events(id,user_id,job_id,time,level,message,url) VALUES(?,?,?,?,?,?,?)",id,user,job,new Date(timestamp).toISOString(),level,message.slice(0,messageLimit),url);
+}
+type CrawlStage="objective"|"sources"|"access"|"fetch"|"extract"|"review"|"save"|"complete";
+function stageStatement(db:DB,user:string,job:string,stage:CrawlStage,message:string,url:string|null=null){
+  return eventStatement(db,user,job,"info",`Stage · ${stage} · ${message}`,url);
+}
+function agentReviewStatement(db:DB,user:string,job:string,review:SupervisionReview){
+  return eventStatement(db,user,job,review.decision==="approve"?"success":"info",AGENT_REVIEW_PREFIX+JSON.stringify(review),review.url,16000);
 }
 function queueStatement(db:DB,user:string,job:string,source:CatalogSource,url:string,depth:number,parent:string|null) {
   return statement(db,"INSERT OR IGNORE INTO atlas_queue(id,user_id,job_id,source_id,url,domain,category,depth,parent_url,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",uid(),user,job,source.id,url,source.domain,source.category || "Custom sources",depth,parent,now());
@@ -198,7 +210,7 @@ export async function readState(db:DB,user:string) {
   const results=await db.batch<Row>([
     statement(db,"SELECT j.*, (SELECT count(*) FROM atlas_queue q WHERE q.job_id=j.id AND q.status IN ('queued','processing')) AS queued FROM atlas_jobs j WHERE user_id=? ORDER BY created_at DESC LIMIT 100",user),
     statement(db,"SELECT * FROM atlas_pages WHERE user_id=? ORDER BY fetched_at DESC LIMIT 2000",user),
-    statement(db,"SELECT * FROM atlas_events WHERE user_id=? ORDER BY time DESC LIMIT 500",user),
+    statement(db,"SELECT * FROM atlas_events WHERE user_id=? ORDER BY time DESC,id DESC LIMIT 500",user),
     statement(db,"SELECT source,target,job_id AS jobId FROM atlas_edges WHERE user_id=? LIMIT 5000",user),
     statement(db,"SELECT * FROM atlas_sources WHERE user_id=? ORDER BY created_at DESC",user),
     statement(db,"SELECT resource_id FROM atlas_bookmarks WHERE user_id=?",user),
@@ -301,6 +313,8 @@ export async function createJob(db:DB,user:string,input:Row,catalog:CatalogSourc
   await db.batch([
     statement(db,"INSERT INTO atlas_jobs(id,user_id,query,status,scope,max_pages,max_depth,processed,indexed,errors,seed_hosts,created_at,updated_at,lease_until) VALUES(?,?,?,'running',?,?,?,0,0,0,?,?,?,0)",id,user,query,scope,maxPages,maxDepth,JSON.stringify(seedHosts),time,time),
     ...seeds.map(s=>queueStatement(db,user,id,s.source,s.url,0,null)),
+    stageStatement(db,user,id,"objective",query?`Validated research objective: ${query}`:"Validated a public research metadata crawl."),
+    stageStatement(db,user,id,"sources",`Validated ${seeds.length} starting source${seeds.length===1?"":"s"}, ${scope==="same-domain"?"selected-domain":"linked-domain"} scope, depth ${maxDepth}, and a ${maxPages}-page limit.`,seeds[0].url),
     eventStatement(db,user,id,"info",`Started crawl with ${seeds.length} starting sources, depth ${maxDepth}, and a ${maxPages}-page limit.`),
   ]);
   return {job:publicJob(await getJob(db,user,id))};
@@ -336,13 +350,15 @@ async function responseText(response:Response):Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
-async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean;metadataSource?:CatalogSource}> {
+async function fetchText(db:DB,url:string,robots=false,seedHosts:string[]=[],scope="linked-domains",catalog:CatalogSource[]=defaultCatalog,onStage?:(stage:"access"|"fetch",url:string)=>Promise<void>):Promise<{url:string;body:string;status:number;contentType:string;noindex:boolean;nofollow:boolean;metadataSource?:CatalogSource}> {
   let current = safeUrl(url);
   for (let redirects=0;redirects<=3;redirects++) {
+    if(!robots)await onStage?.("access",current);
     if (!robots && !inScope(current,seedHosts,scope)) throw new CrawlSkipped("Redirect leaves the selected crawl scope.");
     if(!robots&&isKnownRestrictedUrl(current,catalog))throw new CrawlSkipped("Known paid or mixed-access destination skipped by the free-only policy.");
     const hostState=!robots ? await checkRobots(db,current) : undefined;
     await reserveHost(db,new URL(current).hostname,hostState);
+    if(!robots)await onStage?.("fetch",current);
     const response = await fetch(current,{redirect:"manual",signal:AbortSignal.timeout(8000),headers:{"User-Agent":`${BOT}/1.0 (public research metadata; respects robots.txt)`,Accept:robots?"text/plain":"text/html,application/rss+xml,application/atom+xml,application/xml;q=0.8"}});
     if ([301,302,303,307,308].includes(response.status)) {
       const location = response.headers.get("location"); await response.body?.cancel();
@@ -392,6 +408,7 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
   const lease = await statement(db,"UPDATE atlas_jobs SET lease_until=? WHERE id=? AND user_id=? AND status='running' AND lease_until<?",Date.now()+90_000,id,user,Date.now()).run();
   if (!lease.meta.changes) return {job:publicJob(job),waiting:true};
   let item:Row|null = null;
+  let currentUrl="",candidateReview:SupervisionReview|undefined;
   try {
     // A failed browser request can leave a processing item behind; the expired job lease makes it retryable.
     await statement(db,"UPDATE atlas_queue SET status='queued' WHERE job_id=? AND user_id=? AND status='processing'",id,user).run();
@@ -402,9 +419,15 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
     candidates.sort((a,b)=>Number(a.depth)-Number(b.depth)||linkPriority({url:String(b.url)},String(job.query))-linkPriority({url:String(a.url)},String(job.query)));
     item=candidates[0]||null;
     if (!item) { await finishJob(db,user,id,"All discovered URLs have been processed."); return {job:publicJob(await getJob(db,user,id))}; }
-    await db.batch([statement(db,"UPDATE atlas_queue SET status='processing' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",`Fetching ${String(item.url)}`,String(item.url))]);
+    const initialUrl=String(item.url);currentUrl=initialUrl;
+    await db.batch([statement(db,"UPDATE atlas_queue SET status='processing' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",`Fetching ${initialUrl}`,initialUrl),stageStatement(db,user,id,"access",`Checking public access, crawl scope and robots rules for ${initialUrl}`,initialUrl)]);
     const fetchStarted=Date.now();
-    const fetched = await fetchText(db,String(item.url),false,JSON.parse(String(job.seed_hosts)),String(job.scope),catalog);
+    let firstAccess=true;
+    const fetched = await fetchText(db,initialUrl,false,JSON.parse(String(job.seed_hosts)),String(job.scope),catalog,async(stage,url)=>{
+      currentUrl=url;
+      if(stage==="access"&&firstAccess){firstAccess=false;return;}
+      await stageStatement(db,user,id,stage,stage==="access"?`Checking public access, crawl scope and robots rules for ${url}`:`Requesting document ${url}`,url).run();
+    });
     const fetchSummary=`HTTP ${fetched.status} · ${Date.now()-fetchStarted} ms`;
     const accessGate=detectPaywall(fetched.body,fetched.status,fetched.contentType);
     if(accessGate)throw new CrawlSkipped(accessGate);
@@ -414,20 +437,24 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
       .filter(a=>["robots",BOT.toLowerCase()].includes((a.name || "").toLowerCase()));
     const noindex = fetched.noindex || robotMetas.some(a=>/\b(noindex|none)\b/i.test(a.content || ""));
     if (noindex) throw new CrawlSkipped("Source requests no indexing; metadata was not saved.");
+    await stageStatement(db,user,id,"extract",fetched.metadataSource?`Preparing provider metadata for ${fetched.url}; PDF text is not extracted.`:`Reading metadata and links from ${fetched.url}`,fetched.url).run();
     const extracted:Extracted=fetched.metadataSource?{title:fetched.metadataSource.title||fetched.metadataSource.name,description:fetched.metadataSource.description||"",canonicalUrl:fetched.url,links:[],linkDetails:[],feedEntries:[],tags:[]} : extractDocument(fetched.body,fetched.url,fetched.contentType,String(job.query));
-    if(isKnownRestrictedUrl(extracted.canonicalUrl,catalog))throw new CrawlSkipped("Canonical URL belongs to a paid or mixed-access source; metadata was not saved.");
-    const quality=assessResource({url:extracted.canonicalUrl,title:extracted.title,description:extracted.description},String(job.query));
-    if(quality.reason==="access-gate"||quality.reason==="error")throw new CrawlSkipped(`${fetchSummary} · ${quality.reason==="access-gate"?"Session, login or verification gate":"Error page"}; not indexed.`);
+    await stageStatement(db,user,id,"review",`Checking relevance, access rules and metadata quality for ${extracted.canonicalUrl}`,extracted.canonicalUrl).run();
+    const provenance=sourceForUrl(extracted.canonicalUrl,catalog) as CatalogSource|undefined;
+    const validatedFiling=provenance?.exact===true&&provenance.provider==="SEC EDGAR"&&[provenance.query,...(provenance.queryHistory||[])].some(query=>typeof query==="string"&&query.trim().toLowerCase()===String(job.query).trim().toLowerCase());
+    candidateReview=await reviewCrawlCandidate({url:extracted.canonicalUrl,title:extracted.title,description:extracted.description,query:String(job.query),access:classifyPageAccess({url:extracted.canonicalUrl},catalog),validatedFiling});
+    const review=candidateReview,quality=review.quality,storeMetadata=review.storeMetadata;
+    if(!review.allowDiscovery)throw new CrawlSkipped(`${fetchSummary} · ${review.reason}; not indexed.`);
     const source:CatalogSource = {id:String(item.source_id),name:"",url:String(item.url),domain:String(item.domain),category:String(item.category)};
-    const existing = quality.eligible?await first(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? AND url=?",user,id,extracted.canonicalUrl):null;
+    const existing = storeMetadata?await first(db,"SELECT * FROM atlas_pages WHERE user_id=? AND job_id=? AND url=?",user,id,extracted.canonicalUrl):null;
     const pageId = existing?.id || uid();
     const fetchedAt=now();
     const page=existing || {id:pageId,url:extracted.canonicalUrl,title:extracted.title,description:extracted.description,domain:item.domain,category:item.category,source_id:item.source_id,job_id:id,tags:JSON.stringify(extracted.tags),depth:item.depth,parent_url:item.parent_url,fetched_at:fetchedAt,status:"indexed"};
     const commands:D1PreparedStatement[] = [];
-    if (quality.eligible&&!existing) commands.push(statement(db,"INSERT INTO atlas_pages(id,user_id,job_id,source_id,url,title,description,domain,category,tags,depth,parent_url,fetched_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'indexed')",pageId,user,id,item.source_id,extracted.canonicalUrl,extracted.title,extracted.description,item.domain,item.category,JSON.stringify(extracted.tags),item.depth,item.parent_url,fetchedAt));
+    if (storeMetadata&&!existing) commands.push(statement(db,"INSERT INTO atlas_pages(id,user_id,job_id,source_id,url,title,description,domain,category,tags,depth,parent_url,fetched_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'indexed')",pageId,user,id,item.source_id,extracted.canonicalUrl,extracted.title,extracted.description,item.domain,item.category,JSON.stringify(extracted.tags),item.depth,item.parent_url,fetchedAt));
     const depth = Number(item.depth)+1;
     const nofollow = fetched.nofollow || robotMetas.some(a=>/\b(nofollow|none)\b/i.test(a.content || ""));
-    if (!nofollow && depth <= Number(job.max_depth) && extracted.links.length) {
+    if (review.allowDiscovery&&!nofollow && depth <= Number(job.max_depth) && extracted.links.length) {
       const queueSize = await first(db,"SELECT count(*) AS total FROM atlas_queue WHERE job_id=?",id);
       let remaining = Math.max(0,MAX_QUEUE-Number(queueSize?.total || 0));
       for (const link of extracted.links) {
@@ -441,16 +468,18 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
       }
     }
     commands.push(statement(db,"UPDATE atlas_queue SET status='done' WHERE id=?",item.id));
-    commands.push(statement(db,"UPDATE atlas_jobs SET processed=processed+1,indexed=indexed+?,updated_at=? WHERE id=?",quality.eligible&&!existing?1:0,now(),id));
-    const outcome=!quality.eligible?`Discovery only (${quality.reason}); not indexed: ${extracted.title}`:existing?"Duplicate canonical URL skipped.":fetched.metadataSource?`Indexed provider metadata: ${extracted.title}; PDF full text was not extracted.`:`Indexed metadata: ${extracted.title}`;
-    commands.push(eventStatement(db,user,id,quality.eligible?"success":"info",`${fetchSummary} · ${outcome}`,String(item.url)));
+    commands.push(statement(db,"UPDATE atlas_jobs SET processed=processed+1,indexed=indexed+?,updated_at=? WHERE id=?",storeMetadata&&!existing?1:0,now(),id));
+    const outcome=!storeMetadata?`Discovery only (${quality.reason}); not indexed: ${extracted.title}`:existing?"Duplicate canonical URL skipped.":fetched.metadataSource?`Indexed provider metadata: ${extracted.title}; PDF full text was not extracted.`:`Indexed metadata: ${extracted.title}`;
+    await stageStatement(db,user,id,"save",`Persisting queue, links and eligible metadata for ${extracted.canonicalUrl}`,extracted.canonicalUrl).run();
+    commands.push(agentReviewStatement(db,user,id,review));
+    commands.push(eventStatement(db,user,id,storeMetadata?"success":"info",`${fetchSummary} · ${outcome}`,String(item.url)));
     // Keep individual D1 batches comfortably below statement limits.
     for (let i=0;i<commands.length;i+=70) await db.batch(commands.slice(i,i+70));
     const updatedJob=await completeIfDone(db,user,id);
-    return {job:publicJob(updatedJob),...(quality.eligible?{page:publicPage(page)}:{quality})};
+    return {job:publicJob(updatedJob),...(storeMetadata?{page:publicPage(page)}:{quality})};
   } catch(error) {
     if (item && error instanceof WaitForHost) {
-      await statement(db,"UPDATE atlas_queue SET status='queued' WHERE id=?",item.id).run();
+      await db.batch([statement(db,"UPDATE atlas_queue SET status='queued' WHERE id=? AND user_id=?",item.id,user),eventStatement(db,user,id,"info",error.message,currentUrl||String(item.url))]);
       return {job:publicJob(await getJob(db,user,id)),waiting:true};
     }
     if (item) {
@@ -459,7 +488,8 @@ export async function stepJob(db:DB,user:string,id:string,catalog:CatalogSource[
       await db.batch([
         statement(db,"UPDATE atlas_queue SET status=? WHERE id=?",status,item.id),
         statement(db,"UPDATE atlas_jobs SET processed=processed+1,errors=errors+1,updated_at=? WHERE id=?",now(),id),
-        eventStatement(db,user,id,status,message,String(item.url)),
+        agentReviewStatement(db,user,id,candidateReview||reviewCrawlFailure(currentUrl||String(item.url),String(job.query),message)),
+        eventStatement(db,user,id,status,message,currentUrl||String(item.url)),
       ]);
       return {job:publicJob(await completeIfDone(db,user,id))};
     }
@@ -482,6 +512,7 @@ async function finishJob(db:DB,user:string,id:string,message:string) {
     statement(db,"UPDATE atlas_jobs SET status='completed',updated_at=? WHERE id=? AND user_id=?",finishedAt,id,user),
     statement(db,"UPDATE atlas_queue SET status='skipped' WHERE job_id=? AND user_id=? AND status='queued'",id,user),
     eventStatement(db,user,id,"info",message),
+    stageStatement(db,user,id,"complete",message),
   ]);
   return finishedAt;
 }

@@ -6,10 +6,11 @@ A private research workspace for finance, business, technology, and case studies
 
 - 262 free seed resources across four domains, with descriptions, tags and verification provenance. The complete 371-entry catalog is retained for access classification; paid, mixed and freemium resources are excluded from browsing and recommendations.
 - A chat interface with six built-in research use cases covering AI banking deployments, SaaS pricing, mergers and acquisitions, semiconductor supply chains, Apple quarterly filings, and startup failures. All recommendations are free-only; follow-ups such as “more case studies” refine their relevance.
-- Live, key-free document discovery from OpenAlex, World Bank, and SEC EDGAR, with specific document URLs, abstracts or filing metadata, dates, provenance, and visible provider status. Company report questions use SEC filings with company, form, and reporting-period matching. Results are saved to D1. This is retrieval, not a connected generative language model or full-document synthesis.
+- Live, key-free document discovery from OpenAlex, Crossref, World Bank, and SEC EDGAR, with specific document URLs, abstracts or filing metadata, dates, provenance, and visible provider status. Company report questions use SEC filings with company, form, and reporting-period matching. Results are saved to D1. This is retrieval, not a connected generative language model or full-document synthesis.
 - A server-side HTML/RSS/Atom crawler with persistent queues, graph edges, timestamps, logs, canonical URL deduplication within each run, pause/resume, bounded depth and page limits, robots checks, and host throttling.
+- A backend Chief of Staff coordinates four independent rule-based checks: source structure, free access, topical relevance, and content quality. Its persisted decision controls whether metadata is retained and outgoing links are explored. No paid model or AI API is required.
 - A clearly labeled recorded example from a real crawl (35 public pages, 1,075 discovered URLs, 2,200 hyperlinks) demonstrates the spider in a fresh workspace.
-- A neutral workbench with a distinct radial crawler agent moving between real request destinations, a status dashboard with HTTP timings, anchored URL branching, replay, queue inspection, and keyboard pan/zoom.
+- A neutral workbench with a distinct radial crawler agent moving between real request destinations, a six-panel color telemetry dashboard with HTTP timings, eight event-driven processing stages, anchored URL branching, replay, queue inspection, and keyboard pan/zoom.
 - A dedicated Research results area across crawl runs, with search, stable pagination, purpose, practical reading guidance, research context, bookmarks, and access/provenance labels.
 - Source inspection, keyword/domain filters, custom URLs, JSON database exports, and CSV catalog exports.
 - Cloudflare D1 persistence and per-user authorization through Sites identity headers.
@@ -43,6 +44,14 @@ No unattended schedule or paid API is enabled. Known paid, mixed and freemium se
 
 For a specific filing, try “Apple latest quarterly report”, “AAPL Q1 2025 quarterly report”, or “Microsoft annual report 2024”. Quarter/year requests use the issuer's fiscal calendar unless you explicitly say “calendar”; titles show the actual period-end date. SEC search covers up to two named SEC-reporting companies and recent filings plus one historical page per company. Missing companies or periods produce an explanation rather than unrelated substitute links. Provider rate limits and access failures are visible in the conversation.
 
+If OpenAlex fails or rate-limits requests, Crossref supplies a free fallback. Only relevant records with actual abstracts, a currently effective Creative Commons license, and a publicly reachable document are admitted. The fallback checks the article/PDF response without credentials, rejects access gates, and retains the original provider failure in the search status. Provider requests are bounded and cached; no paid API or account is required.
+
+## Backend supervision
+
+Every fetched candidate is reviewed by Source Scout, Access Guard, Relevance Reviewer, and Quality Reviewer. The Chief of Staff aggregates their findings into **approve**, **archive** (unconfirmed access, excluded from free Results), **discover** (follow useful links without indexing), or **reject** (do not index or traverse). Each review is stored with the crawl, URL, objective, agent reasons, and time. Failures before extraction explicitly mark content checks as not run. These are deterministic metadata checks, not generative agents or a guarantee of factual accuracy.
+
+The live dashboard shows the latest review, actual event log, per-website progress, metadata-term coverage radar and heatmap, query-term match score, and HTTP durations. The Objective → Sources → Access → Fetch → Extract → Review → Save → Complete strip follows recorded backend stages. Metadata scores are labeled and do not claim to measure full-document truth or quality. Replays use recorded observations.
+
 ## Crawl boundaries
 
 The crawler accepts public HTTPS URLs, checks robots.txt, follows at most three redirects, limits each response to 1 MB, and uses bounded requests and per-host delays. It does not bypass paywalls or authentication, execute site JavaScript, extract PDF full text, or archive entire documents. For a successfully fetched PDF with exact provider access evidence, it can retain the provider title/abstract and explicitly labels that metadata basis. Pages that disallow indexing or fail access checks are logged rather than silently counted as successful captures. DNS names are validated and redirects are revalidated; arbitrary hostnames are not resolved and pinned by the application. The hosted runtime's network boundary remains essential.
@@ -64,7 +73,9 @@ Tests cover extraction, robots matching, URL checks, ownership, persistence, pau
 - `app/page.tsx`, `app/graph.tsx`, `app/crawl-dashboard.tsx`, `app/chat.tsx`, `app/results.tsx`: workspace UI
 - `app/api/`: same-origin, authenticated database/crawler/chat endpoints
 - `lib/crawler.ts`: crawling, extraction, queue, and persistence
-- `lib/research.ts`, `lib/discovery.ts`, `lib/filing-discovery.ts`, `lib/discovery-store.ts`: live retrieval, provider adapters, company filing lookup, and persistent document provenance
+- `lib/crawl-supervision.ts`: independent checks, Chief of Staff decisions, and audit format
+- `lib/crawl-metrics.ts`, `app/crawl-process.tsx`: bounded telemetry and recorded processing stages
+- `lib/research.ts`, `lib/discovery.ts`, `lib/filing-discovery.ts`, `lib/document-availability.ts`, `lib/discovery-store.ts`: live retrieval, provider adapters, company filing lookup, public document checks, and persistent provenance
 - `lib/results.ts`: owner-scoped research pagination and filters
 - `lib/free-access.ts`, `lib/resource-quality.ts`, `lib/resource-guide.ts`: access classification, quality/relevance gates, and metadata-based reading guidance
 - `lib/catalog.json`: source catalog with provenance

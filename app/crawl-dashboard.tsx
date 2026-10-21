@@ -1,43 +1,142 @@
 'use client';
-import {useEffect,useMemo,useState} from 'react';
-import {Activity,ArrowUpRight,Check,Globe,Radio} from 'lucide-react';
+import {useEffect,useMemo,useState,type CSSProperties} from 'react';
+import {ArrowUpRight} from 'lucide-react';
+import {computeCrawlMetrics} from '../lib/crawl-metrics';
+import {parseAgentReview,AGENT_REVIEW_PREFIX} from '../lib/crawl-supervision';
 
-type Event={id:string;time:string;level:string;message:string;url?:string};
-const host=(url:string)=>{try{return new URL(url).hostname.replace(/^www\./,'')}catch{return 'Waiting for a request'}};
+type MetricInput=NonNullable<Parameters<typeof computeCrawlMetrics>[0]>;
+type DashboardJob=NonNullable<MetricInput['job']>&{id?:string;processed?:number;queued?:number;errors?:number;maxPages?:number};
+type CrawlEvent={id:string;time:string;level:string;message:string;url?:string};
+type DashboardProps={
+ job?:DashboardJob|null;events:CrawlEvent[];currentUrl:string;fetching:boolean;replay:boolean;
+ discovered:number;telemetryError?:boolean;pages?:MetricInput['pages'];frontier?:MetricInput['frontier'];
+ edges?:Array<{source:string;target:string}>;query?:string;now?:number;
+};
+const EMPTY:never[]=[];
+const ACCENTS=['#65f5b6','#57d9ff','#fa79d9','#edf47a','#ffad78','#b1a1ff'];
+const number=(value:number|null|undefined)=>value==null?'—':Math.round(value).toLocaleString();
+const host=(url:string)=>{try{return new URL(url).hostname.replace(/^www\./,'')}catch{return ''}};
+const path=(url:string)=>{try{const parsed=new URL(url);return parsed.pathname+parsed.search}catch{return url}};
+const elapsedTime=(ms:number|null)=>{if(ms===null)return '—';const seconds=Math.floor(ms/1000);return `${Math.floor(seconds/60).toString().padStart(2,'0')}:${(seconds%60).toString().padStart(2,'0')}`};
+const eventTime=(value:string)=>{const date=new Date(value);return Number.isNaN(date.getTime())?'—':date.toLocaleTimeString([],{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'})};
+const colorFor=(term:string)=>{let hash=0;for(const char of term.toLowerCase())hash=(hash*31+char.charCodeAt(0))>>>0;return ACCENTS[hash%ACCENTS.length]};
+const accent=(color:string)=>({'--telemetry-accent':color}) as CSSProperties;
+const eventColor=(event:CrawlEvent)=>event.level==='error'?'#ffad78':event.level==='warn'?'#edf47a':/save|indexed|collected|complete/i.test(event.message)?'#65f5b6':/fetch|HTTP/.test(event.message)?'#57d9ff':/review|access|skip|blocked/i.test(event.message)?'#fa79d9':'#b1a1ff';
+const decisionLabel=(decision:string)=>decision==='approve'?'approved':decision==='reject'?'rejected':'held';
+const eventText=(message:string)=>{if(message.startsWith(AGENT_REVIEW_PREFIX)){const review=parseAgentReview(message);return review?`Chief ${decisionLabel(review.decision)} · ${host(review.url)}`:'Agent review · unavailable'}return message.replace(/^Stage · /,'').replace(/^HTTP (\d+) · (\d+) ms.*$/,'HTTP $1 · $2 ms')};
 
-export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError}:{job:any;events:Event[];currentUrl:string;fetching:boolean;replay:boolean;discovered:number;telemetryError?:boolean}){
+function Sparkline({values,color,label,fixedMax}:{values:number[];color:string;label:string;fixedMax?:number}){
+ const maximum=fixedMax??Math.max(1,...values),x=(i:number)=>values.length===1?90:4+i*172/(values.length-1),y=(value:number)=>34-Math.min(1,value/maximum)*29;
+ return <svg className="telemetry-sparkline" viewBox="0 0 180 40" role="img" aria-label={label}>
+  <path d="M4 34H176 M4 18H176" className="telemetry-chart-grid"/>
+  {values.length>1&&<polyline points={values.map((value,i)=>`${x(i)},${y(value)}`).join(' ')} fill="none" stroke={color} strokeWidth="1.7" vectorEffect="non-scaling-stroke"/>}
+  {values.length>0&&<circle cx={x(values.length-1)} cy={y(values[values.length-1])} r="2.5" fill={color}/>}
+  {!values.length&&<text x="90" y="25" textAnchor="middle" className="telemetry-empty-mark">—</text>}
+ </svg>;
+}
+
+export default function CrawlDashboard({job,events,currentUrl,fetching,replay,discovered,telemetryError,pages=EMPTY,frontier=EMPTY,edges=EMPTY,query='',now}:DashboardProps){
  const [clock,setClock]=useState(Date.now());
- useEffect(()=>{if(job?.status!=='running')return;const timer=setInterval(()=>setClock(Date.now()),1000);return()=>clearInterval(timer)},[job?.status]);
- const requests=useMemo(()=>events.flatMap(event=>{const match=event.message.match(/^HTTP (\d+) · (\d+) ms/);return match?[{...event,status:Number(match[1]),duration:Number(match[2])}]:[]}).reverse().slice(-24),[events]);
- const durations=requests.map(event=>event.duration),maxDuration=Math.max(1,...durations);
- const points=durations.map((duration,i)=>`${10+i*180/Math.max(1,durations.length-1)},${45-duration/maxDuration*35}`).join(' ');
- const elapsed=job?Math.max(0,((job.status==='running'?clock:Date.parse(job.updatedAt))-Date.parse(job.createdAt))/1000):0;
- const percent=Math.min(100,((job?.processed||0)/(job?.maxPages||1))*100);
- const state=replay?'Recorded replay':fetching?'Fetching page':job?.status==='running'?'Waiting for next request':job?.status==='paused'?'Crawler paused':job?.status==='completed'?'Crawl complete':'Ready to crawl';
- const recent=events.filter(event=>event.url&&event.message.startsWith('Fetching')).slice(0,3);
- return <section className="crawl-dashboard" aria-label="Crawl status dashboard">
-  <div className="monitor-request">
-   <div className="monitor-label"><Radio size={13}/><span>Crawler status</span><span className={fetching||replay?'monitor-live':''}>{state}</span></div>
-   <strong title={currentUrl}>{currentUrl?host(currentUrl):'No active destination'}</strong>
-   <p className="monitor-path" title={currentUrl}>{currentUrl?new URL(currentUrl).pathname:'Start a crawl or replay a previous run.'}</p>
-   {currentUrl&&<a href={currentUrl} target="_blank" rel="noreferrer">Open destination<ArrowUpRight size={11}/></a>}
-   {telemetryError&&<small role="status" className="monitor-warning">Live status interrupted. Retrying…</small>}
-  </div>
-  <div className="monitor-counters">
-   <div className="monitor-label"><Check size={13}/><span>Collection</span><span>{job?.maxPages||0} page limit</span></div>
-   <div className="monitor-count-grid"><span><b>{job?.indexed||0}</b>Collected</span><span><b>{job?.queued||0}</b>Queued</span><span><b>{job?.errors||0}</b>Errors / blocked</span></div>
-   <div className="monitor-progress" role="progressbar" aria-label="Page budget used" aria-valuemin={0} aria-valuemax={job?.maxPages||1} aria-valuenow={job?.processed||0}><i style={{width:`${percent}%`}}/></div>
-   <small>{job?.processed||0} checked · {discovered.toLocaleString()} URLs discovered</small>
-  </div>
-  <div className="monitor-latency">
-   <div className="monitor-label"><Activity size={13}/><span>Fetch duration</span><span>{durations.length?`${durations.at(-1)?.toLocaleString()} ms`:'No samples'}</span></div>
-   {durations.length?<svg viewBox="0 0 200 54" role="img" aria-label={`Last ${durations.length} successful HTTP responses; latest took ${durations.at(-1)} milliseconds.`}><path d="M10 45H190 M10 25H190" stroke="#272c2a" fill="none"/>{durations.length>1&&<polyline points={points} fill="none" stroke="#aac7b8" strokeWidth="1.4"/>}{durations.map((duration,i)=><circle key={i} cx={10+i*180/Math.max(1,durations.length-1)} cy={45-duration/maxDuration*35} r="1.9" fill={requests[i].status<400?'#aac7b8':'#dfac92'}/>)}</svg>:<p className="monitor-no-data">Request timings appear here as pages are fetched.</p>}
-   <small>{Math.floor(elapsed/60)}m {Math.floor(elapsed%60)}s since start · {requests.length} recent responses</small>
-  </div>
-  <div className="monitor-hosts">
-   <div className="monitor-label"><Globe size={13}/><span>Recent destinations</span></div>
-   {recent.length?<ol>{recent.map(event=><li key={event.id}><span title={event.url}>{host(event.url!)}</span><time>{new Date(event.time).toLocaleTimeString([],{hour12:false})}</time></li>)}</ol>:<p className="monitor-no-data">Actual request destinations, in order.</p>}
-   <small>{replay?'Replaying saved activity':job?.status==='running'?'Workspace must stay open to run':'Queue and history saved to your workspace'}</small>
-  </div>
+ const live=job?.status==='running'&&!replay;
+ useEffect(()=>{if(!live)return;setClock(Date.now());const timer=setInterval(()=>setClock(Date.now()),1000);return()=>clearInterval(timer)},[live,job?.id]);
+ // The clock updates the elapsed label; metadata and frontier analysis only rerun when data changes.
+ const snapshot=useMemo(()=>{const sampledAt=now??Date.now();return {sampledAt,metrics:computeCrawlMetrics({pages,frontier,events,edges,query,job,now:sampledAt,replay})}},[pages,frontier,events,edges,query,job,now,replay]);
+ const {metrics}=snapshot;
+ const elapsed=metrics.elapsedMs===null?null:metrics.elapsedMs+(live&&now===undefined?Math.max(0,clock-snapshot.sampledAt):0);
+ const wordsPerMinute=elapsed&&metrics.metadataWordCount?metrics.metadataWordCount*60000/elapsed:null;
+ const orderedEvents=useMemo(()=>[...events].sort((a,b)=>a.time.localeCompare(b.time)||a.id.localeCompare(b.id)),[events]);
+ const logEvents=orderedEvents.slice(-7),latest=orderedEvents.at(-1);
+ const latestReview=useMemo(()=>{for(let i=orderedEvents.length-1;i>=0;i--){const review=parseAgentReview(orderedEvents[i].message);if(review)return review}return null},[orderedEvents]);
+ const stageEvent=[...orderedEvents].reverse().find(event=>event.message.startsWith('Stage · '));
+ const stage=stageEvent?.message.split(' · ')[1]||(fetching?'fetch':job?.status==='completed'?'complete':job?.status==='paused'?'paused':null);
+ const stageMessage=stageEvent?.message.split(' · ').slice(2).join(' · ')||(latest?eventText(latest.message):undefined);
+ const state=replay?'recorded':fetching?'fetching':live?'running':job?.status||'idle';
+ const discoveredCount=useMemo(()=>{const urls=new Set([...pages.map(page=>page.url),...frontier.map(item=>item.url),...edges.flatMap(edge=>[edge.source,edge.target])]);return urls.size||discovered||0},[pages,frontier,edges,discovered]);
+ const isRecorded=replay||Boolean(job&&job.status!=='running');
+ const score=metrics.metadataMatch;
+ const radarRows=metrics.pagesAnalyzed?metrics.termRows:[],radarCount=radarRows.length;
+ const radarPoint=(i:number,radius:number)=>{const angle=-Math.PI/2+i*Math.PI*2/Math.max(1,radarCount);return [100+Math.cos(angle)*radius,78+Math.sin(angle)*radius]};
+ const radarPolygon=(radius:number)=>radarRows.map((_,i)=>radarPoint(i,radius).join(',')).join(' ');
+ const circumference=2*Math.PI*47;
+ const logCount=job?events.length:null;
+ const processed=job?job.processed??0:null,queued=job?job.queued??0:null,errors=job?job.errors??0:null;
+ const budget=job?.maxPages?Math.min(100,Math.max(0,(job.processed||0)/job.maxPages*100)):0;
+ return <section className="crawl-dashboard" aria-label="Crawl telemetry">
+  <section className="telemetry-panel telemetry-log" aria-label="Crawl log" style={accent(ACCENTS[0])}>
+   <header className="telemetry-heading"><h2>Crawl log</h2><span title="Events loaded for this view">{number(logCount)}{job?' events':''}</span></header>
+   <ol className="telemetry-event-list" aria-label="Latest recorded crawl events">
+    {logEvents.map(event=><li key={event.id} title={`${eventTime(event.time)} · ${eventText(event.message)}${event.url?` · ${event.url}`:''}`}><time dateTime={event.time}>{eventTime(event.time)}</time><span style={{color:eventColor(event)}}>{eventText(event.message)}</span></li>)}
+   </ol>
+   {!logEvents.length&&<p className="telemetry-empty">Actual crawl events appear here.</p>}
+   <div className="telemetry-elapsed"><strong>{elapsedTime(elapsed)}</strong><span>{replay?'recorded elapsed':'elapsed since start'}</span><i className={live?'telemetry-status is-live':'telemetry-status'} title={state}/></div>
+   <dl className="telemetry-counts"><div><dt>checked</dt><dd>{number(processed)}</dd></div><div><dt>queued</dt><dd className="telemetry-cyan">{number(queued)}</dd></div><div><dt>blocked / errors</dt><dd className="telemetry-orange">{number(errors)}</dd></div></dl>
+   {telemetryError&&<p role="status" className="telemetry-warning">Status interrupted · retrying</p>}
+  </section>
+
+  <section className="telemetry-panel telemetry-sections" aria-label="Website section progress" style={accent(ACCENTS[1])}>
+   <header className="telemetry-heading"><h2>Sections</h2><span>{job?metrics.websiteCount:'—'}{job?' sites':''}</span></header>
+   <div className="telemetry-site-list">
+    {metrics.websites.map((site,i)=><div className="telemetry-site" key={site.hostname} style={accent(ACCENTS[i%ACCENTS.length])}>
+     <div><span title={site.hostname}>{site.hostname}</span><b title={`${site.checked} checked of ${site.discovered} discovered URLs; ${site.queued} queued, ${site.processing} in progress, ${site.failed} blocked or failed, ${site.discovered-site.checked-site.queued-site.processing} unvisited or unresolved`}>{site.checked}/{site.discovered}</b></div>
+     <div className="telemetry-bar" role="progressbar" aria-label={`${site.hostname} URLs checked`} aria-valuemin={0} aria-valuemax={site.discovered} aria-valuenow={site.checked}><i style={{width:`${site.percent}%`}}/></div>
+    </div>)}
+    {!metrics.websites.length&&<p className="telemetry-empty">Website progress appears as URLs enter the queue.</p>}
+   </div>
+   <footer className="telemetry-footer"><span>checked / discovered</span><b>{job?number(discoveredCount):'—'} URLs</b></footer>
+   {metrics.websiteCount>6&&<p className="telemetry-note">Top 6 of {metrics.websiteCount} websites</p>}
+   <div className="telemetry-budget" title={`${number(processed)} of ${number(job?.maxPages)} page budget used`}><i style={{width:`${budget}%`}}/></div>
+  </section>
+
+  <section className="telemetry-panel telemetry-coverage" aria-label="Coverage radar" style={accent(ACCENTS[0])}>
+   <header className="telemetry-heading"><h2>Coverage radar</h2><span>{metrics.pagesAnalyzed?`${metrics.pagesAnalyzed} pages`:'—'}</span></header>
+   <svg className="telemetry-radar" viewBox="0 0 200 157" role="img" aria-label={radarRows.length?`Captured metadata coverage: ${radarRows.map(row=>`${row.term} in ${Math.round(row.sharePercent)} percent of pages`).join('; ')}.`:'No captured metadata to chart.'}>
+    {radarCount>=3?[20,40,60].map(radius=><polygon key={radius} points={radarPolygon(radius)} className="telemetry-radar-grid"/>):[20,40,60].map(radius=><circle key={radius} cx="100" cy="78" r={radius} className="telemetry-radar-grid"/>)}
+    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,60),[lx,ly]=radarPoint(i,74);return <g key={row.term}><path d={`M100 78L${x} ${y}`} className="telemetry-radar-grid"/><text x={Math.max(28,Math.min(172,lx))} y={ly+3} textAnchor="middle" fill={colorFor(row.term)}>{row.term.length>7?`${row.term.slice(0,6)}…`:row.term}<title>{row.term}: {Math.round(row.sharePercent)}% of captured metadata</title></text></g>})}
+    {radarCount>=3&&<polygon points={radarRows.map((row,i)=>radarPoint(i,60*row.sharePercent/100).join(',')).join(' ')} className="telemetry-radar-value"/>}
+    {radarRows.map((row,i)=>{const [x,y]=radarPoint(i,60*row.sharePercent/100);return <g key={row.term}>{radarCount<3&&<path d={`M100 78L${x} ${y}`} stroke={colorFor(row.term)} strokeWidth="2"/>}<circle cx={x} cy={y} r="2.3" fill={colorFor(row.term)}/></g>})}
+    {!radarCount&&<text x="100" y="83" textAnchor="middle" className="telemetry-empty-mark">—</text>}
+   </svg>
+   <p className="telemetry-note">Share of titles + summaries containing each term.</p>
+   <footer className="telemetry-footer"><span>{radarRows.some(row=>row.origin==='query')?'Query + metadata terms':'Metadata terms'}</span><b>0–100%</b></footer>
+  </section>
+
+  <section className="telemetry-panel telemetry-heat" aria-label="Word heatmap" style={accent(ACCENTS[2])}>
+   <header className="telemetry-heading"><h2>Word heat</h2><span>{metrics.pagesAnalyzed?number(metrics.metadataWordCount):'—'} words</span></header>
+   <div className="telemetry-heat-grid" role="img" aria-label={metrics.columns.length?`Term presence across the latest ${metrics.columns.length} captured pages. Colored cells mean the term is present; dark cells mean absent. Counts include all captured pages.`:'No captured metadata available for word heatmap.'}>
+    {radarRows.map(row=><div className="telemetry-heat-row" key={row.term} style={accent(colorFor(row.term))}>
+     <span className="telemetry-term" title={row.term}>{row.term}</span><div className="telemetry-heat-cells">{row.hits.map((hit,i)=><i key={metrics.columns[i]?.id||i} className={hit?'is-present':''} title={`${row.term}: ${hit?'present':'absent'} in ${metrics.columns[i]?.title||metrics.columns[i]?.url||'page metadata'}`}/>)}</div><b title={`Present in ${row.documentsWithTerm} of ${metrics.pagesAnalyzed} captured pages`}>{row.documentsWithTerm}</b>
+    </div>)}
+    {!radarRows.length&&<p className="telemetry-empty">Term presence appears after metadata is captured.</p>}
+   </div>
+   <div className="telemetry-heat-legend"><span>older → newer</span><span>{metrics.columns.length?`${metrics.columns.length} pages`:'—'}</span></div>
+   <div className="telemetry-word-rate"><span>metadata words / min</span><strong>{number(wordsPerMinute)}</strong></div>
+   <p className="telemetry-note">Colored = present · totals across all pages</p>
+  </section>
+
+  <section className="telemetry-panel telemetry-score" aria-label="Metadata match score" style={accent(ACCENTS[3])}>
+   <header className="telemetry-heading"><h2>Spec score</h2><span>{isRecorded?'recorded':live?'live':'—'}</span></header>
+   <Sparkline values={metrics.matchHistory.slice(-24).map(point=>point.score)} color={ACCENTS[3]} fixedMax={100} label={metrics.matchHistory.length?'Query term match in captured metadata, oldest to newest.':'No query match samples.'}/>
+   <svg className="telemetry-gauge" viewBox="0 0 160 127" role="img" aria-label={score===null?'Metadata match unavailable until query terms and captured pages exist.':`Metadata match ${Math.round(score)} percent. Mean query term coverage in captured page titles and summaries; this does not measure source quality.`}>
+    <circle cx="80" cy="63" r="47" fill="none" stroke="#33352a" strokeWidth="7" strokeDasharray={`${circumference*.75} ${circumference*.25}`} strokeLinecap="round" transform="rotate(135 80 63)"/>
+    {score!==null&&score>0&&<circle cx="80" cy="63" r="47" fill="none" stroke={ACCENTS[3]} strokeWidth="7" strokeDasharray={`${circumference*.75*score/100} ${circumference}`} strokeLinecap="round" transform="rotate(135 80 63)"/>}
+    <text x="80" y="69" textAnchor="middle" className="telemetry-score-value">{score===null?'—':Math.round(score)}</text><text x="80" y="88" textAnchor="middle" className="telemetry-score-caption">metadata match</text>
+    <text x="42" y="116" textAnchor="middle" className="telemetry-gauge-tick">0</text><text x="119" y="116" textAnchor="middle" className="telemetry-gauge-tick">100</text>
+   </svg>
+   <p className="telemetry-note">Mean query-term coverage.<br/>Based on titles + summaries.</p>
+  </section>
+
+  <section className="telemetry-panel telemetry-code" aria-label="Crawler event trace and fetch durations" style={accent(ACCENTS[4])}>
+   <header className="telemetry-heading"><h2>Crawler.ts</h2><span className={live?'telemetry-live-label':''}>{state}</span></header>
+   <div className="telemetry-trace" aria-label="Actual crawler state and latest agent review">
+    <span className="telemetry-code-comment">// latest rule-based review</span>
+    <div className="telemetry-chief"><span>Chief of Staff</span><b className={`review-${latestReview?.decision||'waiting'}`} title={latestReview?`${latestReview.reason} ${latestReview.url}`:'No recorded review yet'}>{latestReview?decisionLabel(latestReview.decision):'—'}</b></div>
+    {latestReview?<dl className="telemetry-agents">{latestReview.agents.map(agent=><div key={agent.id} title={`${agent.name}: ${agent.reason}`}><dt>{agent.name}</dt><dd className={`verdict-${agent.verdict}`}>{agent.verdict}</dd></div>)}</dl>:<p className="telemetry-review-empty">Agent verdicts appear after a candidate is processed.</p>}
+    <div className="telemetry-stage" title={stageMessage}><span className="telemetry-code-key">stage</span><span className="telemetry-code-punctuation">: </span><span className="telemetry-code-value">{stage?`"${stage}"`:'—'}</span></div>
+   </div>
+   {currentUrl?<a className="telemetry-destination" href={currentUrl} target="_blank" rel="noreferrer" title={`Current destination: ${currentUrl}`}><span>{host(currentUrl)}{path(currentUrl)}</span><ArrowUpRight size={11}/></a>:<span className="telemetry-destination telemetry-destination-empty">No current destination</span>}
+   <div className="telemetry-latency-label"><span>HTTP duration</span><b>{number(metrics.latestFetchMs)}{metrics.latestFetchMs!==null?' ms':''}</b></div>
+   <Sparkline values={metrics.fetchSamples.map(sample=>sample.durationMs)} color={ACCENTS[1]} label={metrics.fetchSamples.length?`Last ${metrics.fetchSamples.length} HTTP response durations; latest ${metrics.latestFetchMs} milliseconds.`:'No HTTP timing samples yet.'}/>
+   <footer className="telemetry-footer"><span>{metrics.fetchSamples.length?`${metrics.fetchSamples.length} responses`:'No responses yet'}</span><b>{metrics.averageFetchMs!==null?`${number(metrics.averageFetchMs)} ms avg`:'—'}</b></footer>
+  </section>
  </section>;
 }
